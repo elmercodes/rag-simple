@@ -1,0 +1,1 @@
+Simple RAG built for conversing with documents in a chatbot like interface. Responses will be provided along with a link to the material that most closely answers the question. As documents are uploaded, a database is being built for the LLM to train on.
