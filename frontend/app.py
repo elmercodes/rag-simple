@@ -21,9 +21,10 @@ PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
-from backend.app.db import SessionLocal, engine  # noqa: E402,F401
-from backend.app.db_init import init_db          # noqa: E402
-from backend.app.models import Conversation, Message  # noqa: E402
+from backend.app.db import SessionLocal, engine
+from backend.app.db_init import init_db         
+from backend.app.models import Conversation, Message  
+from backend.app.vectorstore import ingest_pdf, retrieve_context_and_sources 
 
 # ------------------------------------------------------------------------------
 # ONE-TIME DB INIT (per Streamlit process)
@@ -147,6 +148,28 @@ def call_llm_with_retry(client: OpenAI, messages, max_retries: int = 2):
 st.title("Converse With Your Documents")
 
 # ---------- Sidebar: conversations ----------
+st.sidebar.header("Documents")
+
+uploaded_files = st.sidebar.file_uploader(
+    "Upload PDFs",
+    type=["pdf"],
+    accept_multiple_files=True,
+)
+
+if uploaded_files:
+    raw_dir = os.path.join(PROJECT_ROOT, "data", "raw")
+    os.makedirs(raw_dir, exist_ok=True)
+
+    for f in uploaded_files:
+        save_path = os.path.join(raw_dir, f.name)
+        with open(save_path, "wb") as out:
+            out.write(f.read())
+
+        # Ingest into Chroma
+        doc_id = ingest_pdf(save_path)
+        st.sidebar.success(f"Ingested {f.name} (doc_id={doc_id[:8]}...)")
+
+
 st.sidebar.header("Conversations")
 
 convs = list_conversations()
@@ -235,20 +258,44 @@ if prompt:
     full_history = load_conversation_messages(conversation_id)
     trimmed = full_history[-MAX_TURNS:]
 
-    llm_history = [
+    chat_history = [
         {"role": m.role, "content": m.content}
         for m in trimmed
     ]
 
-    # Optional debug of prompt size
-    total_chars = sum(len(m["content"]) for m in llm_history)
-    total_msgs = len(llm_history)
+    # RAG: retrieve context from vector DB based on *current question*
+    context, sources = retrieve_context_and_sources(prompt)
+
+    # Build final messages for LLM
+    system_content = (
+        "You are a helpful assistant. "
+        "Use the provided context to answer the user's question. "
+        "If the answer cannot be found in the context, say you are not sure.\n\n"
+        f"Context:\n{context}"
+        if context
+        else "You are a helpful assistant. There is no external context available."
+    )
+
+    messages = [
+        {"role": "system", "content": system_content},
+        *chat_history,
+    ]
+
+    # Optional debug
+    total_chars = sum(len(m["content"]) for m in messages)
+    total_msgs = len(messages)
     st.sidebar.write(f"DEBUG: {total_msgs} msgs, ~{total_chars} chars total")
 
     try:
         with st.chat_message("assistant"):
-            stream = call_llm_with_retry(client, llm_history)
+            stream = call_llm_with_retry(client, messages)
             response = st.write_stream(stream)
+
+            # Show sources under the answer
+            if sources:
+                st.markdown("**Sources:**")
+                for s in sources:
+                    st.markdown(f"- `{s['filename']}` – page {s['page']}")
 
         save_message(conversation_id, "assistant", response)
 
