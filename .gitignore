@@ -20,6 +20,7 @@ Thumbs.db
 data/raw/
 data/processed/
 chat.db
+data/vector_store/
 
 # Folder
 .streamlit/

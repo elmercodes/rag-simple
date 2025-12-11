@@ -150,3 +150,58 @@ def retrieve_context_and_sources(
     context = "\n\n---\n\n".join(docs)
 
     return context, sources
+
+def retrieve_hits(
+    query: str,
+    k: int = 8,
+) -> List[Dict]:
+    q_vec = embed_texts([query])[0]
+
+    res = _collection.query(
+        query_embeddings=[q_vec],
+        n_results=k,
+        include=["documents", "metadatas", "distances"],
+    )
+
+    if not res["documents"] or not res["documents"][0]:
+        return []
+
+    docs = res["documents"][0]
+    metas = res["metadatas"][0]
+    dists = res["distances"][0]
+
+    hits = []
+    for doc, meta, dist in zip(docs, metas, dists):
+        score = 1 / (1 + dist)  # simple monotonic score
+        excerpt = doc.strip().replace("\n", " ")
+        excerpt = excerpt[:300] + ("..." if len(excerpt) > 300 else "")
+        hits.append(
+            {
+                "score": score,
+                "text": doc,
+                "excerpt": excerpt,
+                "filename": meta.get("filename"),
+                "page": meta.get("page"),
+                "doc_id": meta.get("doc_id"),
+                "chunk_index": meta.get("chunk_index"),
+            }
+        )
+    return hits
+
+
+def build_context_and_sources(hits: List[Dict], top_pages: int = 2):
+    # context = join top chunk texts
+    context = "\n\n---\n\n".join([h["text"] for h in hits])
+
+    # aggregate by page to pick best pages
+    from collections import defaultdict
+    page_scores = defaultdict(float)
+    for h in hits:
+        key = (h["doc_id"], h["filename"], h["page"])
+        page_scores[key] += h["score"]
+
+    best_pages = sorted(page_scores.items(), key=lambda x: x[1], reverse=True)[:top_pages]
+    pages = [{"doc_id": k[0][0], "filename": k[0][1], "page": k[0][2]} for k in best_pages]
+
+    return context, pages
+

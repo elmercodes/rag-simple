@@ -25,6 +25,8 @@ from backend.app.db import SessionLocal, engine
 from backend.app.db_init import init_db         
 from backend.app.models import Conversation, Message  
 from backend.app.vectorstore import ingest_pdf, retrieve_context_and_sources 
+from backend.app.vectorstore import retrieve_hits, build_context_and_sources
+
 
 # ------------------------------------------------------------------------------
 # ONE-TIME DB INIT (per Streamlit process)
@@ -264,7 +266,8 @@ if prompt:
     ]
 
     # RAG: retrieve context from vector DB based on *current question*
-    context, sources = retrieve_context_and_sources(prompt)
+    hits = retrieve_hits(prompt, k=8)
+    context, sources = build_context_and_sources(hits, top_pages=2)
 
     # Build final messages for LLM
     system_content = (
@@ -291,13 +294,18 @@ if prompt:
             stream = call_llm_with_retry(client, messages)
             response = st.write_stream(stream)
 
-            # Show sources under the answer
-            if sources:
-                st.markdown("**Sources:**")
-                for s in sources:
-                    st.markdown(f"- `{s['filename']}` – page {s['page']}")
+            # --- SHOW RETRIEVAL DEBUG (EXCERPTS) ---
+            if hits:
+                st.markdown("### 🔍 Retrieved evidence")
+                for h in hits[:3]:  # top 3 chunks
+                    st.markdown(
+                        f"**{h['filename']} – page {h['page']}** "
+                        f"(score {h['score']:.3f})\n\n"
+                        f"> {h['excerpt']}"
+                    )
 
         save_message(conversation_id, "assistant", response)
+
 
     except AuthenticationError as e:
         st.error("OpenAI authentication failed. Check your API key in st.secrets.")
