@@ -1,33 +1,53 @@
-import streamlit as st
-from datetime import datetime, timezone
-import time
-from openai import OpenAI
-from openai import OpenAI, APIConnectionError, APIStatusError, AuthenticationError
-
-
 import os
 import sys
+import time
+from datetime import datetime, timezone
+
+import streamlit as st
+from openai import OpenAI
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    AuthenticationError,
+)
+
+# ------------------------------------------------------------------------------
+# PATH / IMPORTS
+# ------------------------------------------------------------------------------
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
 
-print(PROJECT_ROOT)
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
-from backend.app.db import SessionLocal, engine
-from backend.app.db_init import init_db
-from backend.app.models import Conversation, Message
+from backend.app.db import SessionLocal, engine  # noqa: E402,F401
+from backend.app.db_init import init_db          # noqa: E402
+from backend.app.models import Conversation, Message  # noqa: E402
 
-init_db() 
+# ------------------------------------------------------------------------------
+# ONE-TIME DB INIT (per Streamlit process)
+# ------------------------------------------------------------------------------
+
+if "db_initialized" not in st.session_state:
+    init_db()
+    st.session_state["db_initialized"] = True
+
+# ------------------------------------------------------------------------------
+# OPENAI CLIENT
+# ------------------------------------------------------------------------------
 
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 if "openai_model" not in st.session_state:
     st.session_state["openai_model"] = "gpt-5-nano"
-    
 
-def create_conversation():
+# ------------------------------------------------------------------------------
+# DB HELPERS
+# ------------------------------------------------------------------------------
+
+
+def create_conversation() -> int:
     """Create a new conversation row and return its id."""
     db = SessionLocal()
     try:
@@ -42,37 +62,6 @@ def create_conversation():
         db.close()
 
 
-def load_conversation_messages(conversation_id):
-    db = SessionLocal()
-    try:
-        # Query the conversation row
-        conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
-
-        # If conversation doesn't exist (rare), return empty list
-        if not conv:
-            return []
-
-        # conv.messages is automatically retrieved & sorted (because of relationship)
-        return conv.messages
-    finally:
-        db.close()
-def save_message(conversation_id, role, content):
-    db = SessionLocal()
-    try:
-        msg = Message(
-            conversation_id=conversation_id,
-            role=role,     # 'user' or 'assistant'
-            content=content
-        )
-
-        db.add(msg)     # stage insert
-        db.commit()     # write to database
-        db.refresh(msg) # populate msg.id and timestamp
-
-        return msg
-    finally:
-        db.close()
-        
 def list_conversations(limit: int = 20):
     db = SessionLocal()
     try:
@@ -84,11 +73,60 @@ def list_conversations(limit: int = 20):
         )
     finally:
         db.close()
-        
-from openai import APIConnectionError
-import time
 
-def call_llm_with_retry(client, messages, max_retries=2):
+
+def load_conversation_messages(conversation_id: int):
+    db = SessionLocal()
+    try:
+        conv = (
+            db.query(Conversation)
+            .filter(Conversation.id == conversation_id)
+            .first()
+        )
+        if not conv:
+            return []
+        return conv.messages
+    finally:
+        db.close()
+
+
+def save_message(conversation_id: int, role: str, content: str):
+    db = SessionLocal()
+    try:
+        msg = Message(
+            conversation_id=conversation_id,
+            role=role,     # 'user' or 'assistant'
+            content=content,
+        )
+        db.add(msg)
+        db.commit()
+        db.refresh(msg)
+        return msg
+    finally:
+        db.close()
+
+
+def update_conversation_title(conversation_id: int, new_title: str):
+    db = SessionLocal()
+    try:
+        conv = (
+            db.query(Conversation)
+            .filter(Conversation.id == conversation_id)
+            .first()
+        )
+        if conv:
+            conv.title = new_title
+            db.commit()
+    finally:
+        db.close()
+
+
+# ------------------------------------------------------------------------------
+# OPENAI CALL + RETRY
+# ------------------------------------------------------------------------------
+
+
+def call_llm_with_retry(client: OpenAI, messages, max_retries: int = 2):
     for attempt in range(max_retries):
         try:
             return client.chat.completions.create(
@@ -96,12 +134,16 @@ def call_llm_with_retry(client, messages, max_retries=2):
                 messages=messages,
                 stream=True,
             )
-        except APIConnectionError as e:
+        except APIConnectionError:
             if attempt == max_retries - 1:
-                raise  # re-raise after last attempt
-            time.sleep(1.5)  # brief backoff and retry
-        
-################################################################### STREAMLIT BEGINS
+                raise
+            time.sleep(1.5)  # brief backoff
+
+
+# ------------------------------------------------------------------------------
+# STREAMLIT APP
+# ------------------------------------------------------------------------------
+
 st.title("Converse With Your Documents")
 
 # ---------- Sidebar: conversations ----------
@@ -118,7 +160,6 @@ if not convs:
 if "conversation_id" not in st.session_state:
     st.session_state.conversation_id = convs[0].id
 else:
-    # If stored id is no longer in DB, fall back to first
     conv_ids = {c.id for c in convs}
     if st.session_state.conversation_id not in conv_ids:
         st.session_state.conversation_id = convs[0].id
@@ -129,14 +170,12 @@ if st.sidebar.button("➕ New chat"):
     st.session_state.conversation_id = new_id
     st.rerun()
 
-# Determine which index in convs matches the current id
 current_id = st.session_state.conversation_id
 current_index = next(
     (i for i, c in enumerate(convs) if c.id == current_id),
     0,  # fallback to first
 )
 
-# Selectbox is always in sync with conversation_id
 selected_conv = st.sidebar.selectbox(
     "Select a conversation",
     options=convs,
@@ -149,7 +188,28 @@ if selected_conv.id != current_id:
     st.session_state.conversation_id = selected_conv.id
     st.rerun()
 
-# Single source of truth for the rest of the app:
+# ---- Rename conversation ----
+st.sidebar.subheader("Rename conversation")
+
+new_title = st.sidebar.text_input(
+    "Title",
+    value=selected_conv.title or "",
+    key="conv_title_input",
+)
+
+if st.sidebar.button("Save title"):
+    cleaned_title = new_title.strip() or "Untitled"
+    update_conversation_title(selected_conv.id, cleaned_title)
+    st.rerun()
+
+st.sidebar.caption(
+    "💡 Tip: For best results, wait for the AI to finish responding "
+    "before renaming or switching conversations. If a response stops, "
+    "refresh and resend your last message."
+)
+
+# ------------------- Main chat area ----------------------
+
 conversation_id = st.session_state.conversation_id
 
 history = load_conversation_messages(conversation_id)
@@ -158,42 +218,48 @@ for msg in history:
     with st.chat_message(msg.role):
         st.write(msg.content)
 
-# 2) New message from user
-if prompt := st.chat_input("Ask me something..."):
-    # Save user message to DB
+
+# New message from user
+prompt = st.chat_input("Ask me something...")
+
+if prompt:
+    # Save user message
     save_message(conversation_id, "user", prompt)
 
-    # Show user message in UI
+    # Show user message
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Build history for OpenAI from DB (NOT session_state)
-    history = load_conversation_messages(conversation_id)
+    # Build history for LLM (trim to last N turns)
+    MAX_TURNS = 8
+    full_history = load_conversation_messages(conversation_id)
+    trimmed = full_history[-MAX_TURNS:]
+
     llm_history = [
         {"role": m.role, "content": m.content}
-        for m in history
+        for m in trimmed
     ]
+
+    # Optional debug of prompt size
+    total_chars = sum(len(m["content"]) for m in llm_history)
+    total_msgs = len(llm_history)
+    st.sidebar.write(f"DEBUG: {total_msgs} msgs, ~{total_chars} chars total")
+
     try:
-        # 3) Call OpenAI with streaming, just like your original code
         with st.chat_message("assistant"):
-        # TRY with retry logic instead of a raw OpenAI call
             stream = call_llm_with_retry(client, llm_history)
             response = st.write_stream(stream)
 
         save_message(conversation_id, "assistant", response)
 
-
     except AuthenticationError as e:
         st.error("OpenAI authentication failed. Check your API key in st.secrets.")
         st.exception(e)
-    except APIConnectionError as e:
-        st.error("Couldn't reach OpenAI API (network / VPN / DNS issue).")
-        st.exception(e)
+    except APIConnectionError:
+        st.warning("Lost connection to OpenAI while answering. Please try again.")
     except APIStatusError as e:
         st.error(f"OpenAI API returned an error: {e.status_code}")
         st.exception(e)
     except Exception as e:
         st.error("Unexpected error talking to OpenAI.")
         st.exception(e)
-
-

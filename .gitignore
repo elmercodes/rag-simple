@@ -19,6 +19,7 @@ Thumbs.db
 # Data (optional):
 data/raw/
 data/processed/
+chat.db
 
 # Folder
 .streamlit/
