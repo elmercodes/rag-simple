@@ -3,6 +3,7 @@ import os
 import uuid
 from typing import List, Dict, Tuple
 from collections import defaultdict
+import re
 
 import chromadb
 from pypdf import PdfReader
@@ -28,19 +29,49 @@ _collection = _client.get_or_create_collection("docs")
 # CHUNKING
 # --------------------------------------------------------------------
 
-def _chunk_text(text: str, chunk_size: int = 800, overlap: int = 200) -> List[str]:
-    """Simple character-based chunking with overlap."""
-    text = text.strip()
+def _chunk_text(text: str, chunk_size: int = 1200, overlap: int = 200) -> List[str]:
+    """
+    Paragraph-aware chunking:
+    - split into paragraphs
+    - pack paragraphs into ~chunk_size chunks
+    - add overlap (last overlap chars) between chunks
+    """
+    text = (text or "").strip()
     if not text:
         return []
+
+    # Normalize whitespace
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    if not paragraphs:
+        return []
+
     chunks = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunk = text[start:end]
-        chunks.append(chunk)
-        start = end - overlap  # slide window with overlap
+    buf = ""
+
+    for p in paragraphs:
+        if len(buf) + len(p) + 2 <= chunk_size:
+            buf = (buf + "\n\n" + p).strip() if buf else p
+        else:
+            if buf:
+                chunks.append(buf)
+            buf = p
+
+    if buf:
+        chunks.append(buf)
+
+    # Add overlap by prefixing each chunk with tail of previous chunk
+    if overlap > 0 and len(chunks) > 1:
+        overlapped = [chunks[0]]
+        for i in range(1, len(chunks)):
+            prev = chunks[i - 1]
+            tail = prev[-overlap:]
+            overlapped.append((tail + "\n\n" + chunks[i]).strip())
+        chunks = overlapped
+
     return chunks
+
 
 
 # --------------------------------------------------------------------
@@ -69,16 +100,25 @@ def ingest_pdf(path: str) -> str:
         for i, chunk in enumerate(chunks):
             chunk_id = str(uuid.uuid4())
             ids.append(chunk_id)
+
             chunk_with_header = f"Document: {filename}\nPage: {page_idx}\n\n{chunk}"
             docs.append(chunk_with_header)
+
+            # ---- NEW: better metadata ----
+            preview = chunk.strip().replace("\n", " ")
+            preview = preview[:200] + ("..." if len(preview) > 200 else "")
+
             metas.append(
                 {
                     "doc_id": doc_id,
                     "filename": filename,
                     "page": page_idx,
                     "chunk_index": i,
+                    "char_len": len(chunk),
+                    "preview": preview,
                 }
             )
+
 
     # No text? Still return doc_id so caller knows we "handled" it.
     if not docs:
