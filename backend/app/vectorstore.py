@@ -9,6 +9,8 @@ import chromadb
 from pypdf import PdfReader
 
 from .embeddings import embed_texts
+from .sectioning import detect_section_from_page_text
+
 
 # --------------------------------------------------------------------
 # PATHS & CLIENT
@@ -94,8 +96,16 @@ def ingest_pdf(path: str) -> str:
     docs = []
     metas = []
 
+    current_section = "other"
+
     for page_idx, page in enumerate(reader.pages, start=1):
         page_text = page.extract_text() or ""
+        current_section = detect_section_from_page_text(
+            page_text,
+            current_section=current_section,
+            enable_paper_patterns=True,  # works for papers + general docs
+        )
+
         chunks = _chunk_text(page_text)
         for i, chunk in enumerate(chunks):
             chunk_id = str(uuid.uuid4())
@@ -114,6 +124,7 @@ def ingest_pdf(path: str) -> str:
                     "filename": filename,
                     "page": page_idx,
                     "chunk_index": i,
+                    "section": current_section,
                     "char_len": len(chunk),
                     "preview": preview,
                 }
@@ -193,14 +204,23 @@ def retrieve_context_and_sources(
 
 def retrieve_hits(
     query: str,
-    k: int = 8,
+    k: int = 30,
+    intent: str = "general",
+    hard_sections: list[str] | None = None,
+    preferred: list[str] | None = None,
 ) -> List[Dict]:
     q_vec = embed_texts([query])[0]
+
+    # --- OPTIONAL HARD FILTER BY SECTION ---
+    where = None
+    if hard_sections:
+        where = {"section": {"$in": hard_sections}}
 
     res = _collection.query(
         query_embeddings=[q_vec],
         n_results=k,
         include=["documents", "metadatas", "distances"],
+        where=where,  # <-- this is the key change
     )
 
     if not res["documents"] or not res["documents"][0]:
@@ -212,9 +232,26 @@ def retrieve_hits(
 
     hits = []
     for doc, meta, dist in zip(docs, metas, dists):
-        score = 1 / (1 + dist)  # simple monotonic score
+        section = meta.get("section", "other")
+
+        # Base score from vector similarity
+        score = 1 / (1 + dist)
+
+        # --- RULE 2: DISCOUNT IMPACT SECTION FOR TECHNICAL CLAIMS ---
+        # (generalized "Broader Impact" rule)
+        if intent != "impact" and section == "impact":
+            score *= 0.35
+
+        # --- RULE 1/3: EVIDENCE-TYPE MATCHING (SOFT BOOST/PENALTY) ---
+        if preferred:
+            if section in preferred:
+                score *= 1.25
+            else:
+                score *= 0.90
+
         excerpt = doc.strip().replace("\n", " ")
         excerpt = excerpt[:300] + ("..." if len(excerpt) > 300 else "")
+
         hits.append(
             {
                 "score": score,
@@ -224,8 +261,12 @@ def retrieve_hits(
                 "page": meta.get("page"),
                 "doc_id": meta.get("doc_id"),
                 "chunk_index": meta.get("chunk_index"),
+                "section": section, 
             }
         )
+
+    hits.sort(key=lambda h: h["score"], reverse=True)
+
     return hits
 
 

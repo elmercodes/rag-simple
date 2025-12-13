@@ -24,9 +24,10 @@ if PROJECT_ROOT not in sys.path:
 from backend.app.db import SessionLocal, engine
 from backend.app.db_init import init_db         
 from backend.app.models import Conversation, Message  
-from backend.app.vectorstore import ingest_pdf, retrieve_context_and_sources 
-from backend.app.vectorstore import retrieve_hits, build_context_and_sources
 from backend.app.rerank import rerank
+from backend.app.retrieval_policy import classify_intent, preferred_sections, should_hard_filter
+from backend.app.vectorstore import ingest_pdf, retrieve_hits, build_context_and_sources
+
 
 
 # ------------------------------------------------------------------------------
@@ -44,7 +45,7 @@ if "db_initialized" not in st.session_state:
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 if "openai_model" not in st.session_state:
-    st.session_state["openai_model"] = "gpt-5-nano"
+    st.session_state["openai_model"] = "gpt-5"
 
 # ------------------------------------------------------------------------------
 # DB HELPERS
@@ -267,9 +268,28 @@ if prompt:
         for m in trimmed
     ]
 
-    # RAG: retrieve context from vector DB based on *current question*
-    hits = retrieve_hits(prompt, k=20)   # retrieve more candidates
-    hits = rerank(prompt, hits, top_n=8) # rerank down to best 8
+    # -------------------- Retrieval policy (intent -> sections) --------------------
+    intent = classify_intent(prompt)
+    preferred = preferred_sections(intent)
+
+    hard_sections = None
+    if should_hard_filter(intent) and preferred:
+        # hard filter only for intents we consider "safe" to restrict
+        hard_sections = preferred
+
+    # Retrieve more candidates (policy-aware)
+    hits = retrieve_hits(
+        prompt,
+        k=30,
+        intent=intent,
+        hard_sections=hard_sections,
+        preferred=preferred,
+    )
+
+    # Rerank AFTER policy scoring
+    hits = rerank(prompt, hits, top_n=8)
+
+    # Build context + top page sources
     context, sources = build_context_and_sources(hits, top_pages=2)
 
 
@@ -301,9 +321,13 @@ if prompt:
             # --- SHOW RETRIEVAL DEBUG (EXCERPTS) ---
             if hits:
                 st.markdown("### 🔍 Retrieved evidence")
+                st.caption(
+                    f"Intent: `{intent}` | Preferred: {preferred or 'None'} | "
+                    f"Hard filter: {hard_sections or 'None'}"
+                )
                 for h in hits[:3]:  # top 3 chunks
                     st.markdown(
-                        f"**{h['filename']} – page {h['page']}** "
+                        f"**{h['filename']} – page {h['page']} – `{h.get('section','other')}`** "
                         f"(score {h['score']:.3f})\n\n"
                         f"> {h['excerpt']}"
                     )
