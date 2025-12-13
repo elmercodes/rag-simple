@@ -140,7 +140,7 @@ def call_llm_with_retry(client: OpenAI, messages, max_retries: int = 2):
         except APIConnectionError:
             if attempt == max_retries - 1:
                 raise
-            time.sleep(1.5)  # brief backoff
+            time.sleep(1.5)  
 
 
 # ------------------------------------------------------------------------------
@@ -151,6 +151,12 @@ st.title("Converse With Your Documents")
 
 # ---------- Sidebar: conversations ----------
 st.sidebar.header("Documents")
+
+st.sidebar.caption(
+    "💡 Tip: For best results, wait for the AI to finish responding "
+    "before renaming or switching conversations. If a response stops, "
+    "refresh and resend your last message."
+)
 
 uploaded_files = st.sidebar.file_uploader(
     "Upload PDFs",
@@ -227,11 +233,6 @@ if st.sidebar.button("Save title"):
     update_conversation_title(selected_conv.id, cleaned_title)
     st.rerun()
 
-st.sidebar.caption(
-    "💡 Tip: For best results, wait for the AI to finish responding "
-    "before renaming or switching conversations. If a response stops, "
-    "refresh and resend your last message."
-)
 
 # ------------------- Main chat area ----------------------
 
