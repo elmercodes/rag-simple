@@ -244,4 +244,3 @@ def build_context_and_sources(hits: List[Dict], top_pages: int = 2):
     pages = [{"doc_id": k[0][0], "filename": k[0][1], "page": k[0][2]} for k in best_pages]
 
     return context, pages
-

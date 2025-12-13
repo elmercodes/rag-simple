@@ -26,6 +26,7 @@ from backend.app.db_init import init_db
 from backend.app.models import Conversation, Message  
 from backend.app.vectorstore import ingest_pdf, retrieve_context_and_sources 
 from backend.app.vectorstore import retrieve_hits, build_context_and_sources
+from backend.app.rerank import rerank
 
 
 # ------------------------------------------------------------------------------
@@ -267,8 +268,10 @@ if prompt:
     ]
 
     # RAG: retrieve context from vector DB based on *current question*
-    hits = retrieve_hits(prompt, k=8)
+    hits = retrieve_hits(prompt, k=20)   # retrieve more candidates
+    hits = rerank(prompt, hits, top_n=8) # rerank down to best 8
     context, sources = build_context_and_sources(hits, top_pages=2)
+
 
     # Build final messages for LLM
     system_content = (
