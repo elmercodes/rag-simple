@@ -31,7 +31,7 @@ _collection = _client.get_or_create_collection("docs")
 # CHUNKING
 # --------------------------------------------------------------------
 
-def _chunk_text(text: str, chunk_size: int = 1200, overlap: int = 200) -> List[str]:
+def _chunk_text(text: str, chunk_size: int = 1200, overlap: int = 0) -> List[str]:
     """
     Paragraph-aware chunking:
     - split into paragraphs
@@ -111,8 +111,7 @@ def ingest_pdf(path: str) -> str:
             chunk_id = str(uuid.uuid4())
             ids.append(chunk_id)
 
-            chunk_with_header = f"Document: {filename}\nPage: {page_idx}\n\n{chunk}"
-            docs.append(chunk_with_header)
+            docs.append(chunk)
 
             # ---- NEW: better metadata ----
             preview = chunk.strip().replace("\n", " ")
@@ -252,36 +251,73 @@ def retrieve_hits(
         excerpt = doc.strip().replace("\n", " ")
         excerpt = excerpt[:300] + ("..." if len(excerpt) > 300 else "")
 
-        hits.append(
-            {
-                "score": score,
-                "text": doc,
-                "excerpt": excerpt,
-                "filename": meta.get("filename"),
-                "page": meta.get("page"),
-                "doc_id": meta.get("doc_id"),
-                "chunk_index": meta.get("chunk_index"),
-                "section": section, 
-            }
-        )
+        raw = doc  # doc is now raw chunk text
+
+        display_text = f"Document: {meta.get('filename')}\nPage: {meta.get('page')}\n\n{raw}"
+
+        excerpt = raw.strip().replace("\n", " ")
+        excerpt = excerpt[:300] + ("..." if len(excerpt) > 300 else "")
+
+        hits.append({
+            "score": score,
+            "raw_text": raw,          # ✅ for rerank/verify
+            "text": display_text,     # ✅ for context shown to LLM (optional)
+            "excerpt": excerpt,       # ✅ for UI
+            "filename": meta.get("filename"),
+            "page": meta.get("page"),
+            "doc_id": meta.get("doc_id"),
+            "chunk_index": meta.get("chunk_index"),
+            "section": section,
+        })
+
 
     hits.sort(key=lambda h: h["score"], reverse=True)
 
     return hits
 
 
-def build_context_and_sources(hits: List[Dict], top_pages: int = 2):
-    # context = join top chunk texts
-    context = "\n\n---\n\n".join([h["text"] for h in hits])
 
-    # aggregate by page to pick best pages
-    from collections import defaultdict
+def build_context_and_sources(
+    hits: List[Dict],
+    top_pages: int = 2,
+    chunks_per_page: int = 4,
+) -> Tuple[str, List[Dict]]:
+    """
+    Page-first selection using rerank_score when present.
+    Then build context ONLY from chunks on selected pages.
+    """
+
+    if not hits:
+        return "", []
+
+    # Use rerank_score if available, else fall back to score
+    def s(h: Dict) -> float:
+        return float(h.get("rerank_score", h.get("score", 0.0)))
+
+    # 1) Aggregate score by (doc_id, filename, page)
     page_scores = defaultdict(float)
+    page_to_hits = defaultdict(list)
+
     for h in hits:
         key = (h["doc_id"], h["filename"], h["page"])
-        page_scores[key] += h["score"]
+        page_scores[key] += s(h)
+        page_to_hits[key].append(h)
 
+    # 2) Pick top pages
     best_pages = sorted(page_scores.items(), key=lambda x: x[1], reverse=True)[:top_pages]
-    pages = [{"doc_id": k[0][0], "filename": k[0][1], "page": k[0][2]} for k in best_pages]
+    selected_page_keys = [k for (k, _) in best_pages]
 
-    return context, pages
+    sources = [{"doc_id": k[0], "filename": k[1], "page": k[2]} for k in selected_page_keys]
+
+    # 3) Build context: only from selected pages, best chunks first
+    selected_hits = []
+    for k in selected_page_keys:
+        page_hits = sorted(page_to_hits[k], key=s, reverse=True)[:chunks_per_page]
+        selected_hits.extend(page_hits)
+
+    # Keep overall ordering by score
+    selected_hits.sort(key=s, reverse=True)
+
+    context = "\n\n---\n\n".join([h["text"] for h in selected_hits])
+    return context, sources, selected_hits
+

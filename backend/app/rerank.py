@@ -5,7 +5,8 @@ from sentence_transformers import CrossEncoder
 _model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 def rerank(query: str, hits: List[Dict], top_n: int = 8) -> List[Dict]:
-    pairs = [(query, h["text"]) for h in hits]
+    pairs = [(query, h.get("raw_text", h["text"])) for h in hits]
+
     scores = _model.predict(pairs)
 
     for h, s in zip(hits, scores):

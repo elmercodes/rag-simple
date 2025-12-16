@@ -27,6 +27,7 @@ from backend.app.models import Conversation, Message
 from backend.app.rerank import rerank
 from backend.app.retrieval_policy import classify_intent, preferred_sections, should_hard_filter
 from backend.app.vectorstore import ingest_pdf, retrieve_hits, build_context_and_sources
+from backend.app.verification import verify_answer
 
 
 
@@ -219,6 +220,7 @@ selected_conv = st.sidebar.selectbox(
 # If user chose a different conversation, update state and rerun
 if selected_conv.id != current_id:
     st.session_state.conversation_id = selected_conv.id
+
     st.rerun()
 
 # ---- Rename conversation ----
@@ -287,21 +289,22 @@ if prompt:
     )
 
     # Rerank AFTER policy scoring
-    hits = rerank(prompt, hits, top_n=8)
+    hits = rerank(prompt, hits, top_n=18)
 
-    # Build context + top page sources
-    context, sources = build_context_and_sources(hits, top_pages=2)
+    # Build context + top page sources + 
+    context, sources, evidence_hits = build_context_and_sources(hits, top_pages=2)
+
 
 
     # Build final messages for LLM
     system_content = (
-        "You are a helpful assistant. "
-        "Use the provided context to answer the user's question. "
-        "If the answer cannot be found in the context, say you are not sure.\n\n"
+        "You are a helpful assistant answering questions using ONLY the provided context. "
+        "If the answer is not explicitly supported by the context, say you can't find it.\n\n"
         f"Context:\n{context}"
         if context
         else "You are a helpful assistant. There is no external context available."
     )
+
 
     messages = [
         {"role": "system", "content": system_content},
@@ -315,8 +318,43 @@ if prompt:
 
     try:
         with st.chat_message("assistant"):
+            placeholder = st.empty()
+
+            # 1) Stream draft answer
             stream = call_llm_with_retry(client, messages)
-            response = st.write_stream(stream)
+            draft = placeholder.write_stream(stream)
+
+            # 2) Verify against the SAME evidence you used for context
+            verified, vdebug = verify_answer(
+                draft,
+                evidence_hits,
+                support_threshold=0.78,
+                weak_threshold=0.70,
+            )
+
+            # 3) Replace draft with verified answer
+            placeholder.markdown(verified)
+
+            # 4) Show sources (top 2 pages you selected)
+            if sources:
+                st.markdown("### 📌 Sources")
+                for s in sources:
+                    st.markdown(f"- **{s['filename']}** — page {s['page']}")
+
+            # 5) Optional: verifier debug in sidebar
+            st.sidebar.write(
+                f"Verifier: kept={vdebug.get('kept', 0)} | dropped={vdebug.get('dropped', 0)}"
+            )
+
+            # Optional: show claim-level debug (toggle)
+            with st.expander("Verifier details (debug)"):
+                for c in vdebug.get("claims", []):
+                    st.markdown(
+                        f"- **{c['status']}** (sim={c['similarity']:.3f}) "
+                        f"→ {c.get('best_file')} p.{c.get('best_page')}\n\n"
+                        f"  **Claim:** {c['claim']}\n\n"
+                        f"  **Best snippet:** {c['snippet']}"
+                    )
 
             # --- SHOW RETRIEVAL DEBUG (EXCERPTS) ---
             if hits:
@@ -325,15 +363,15 @@ if prompt:
                     f"Intent: `{intent}` | Preferred: {preferred or 'None'} | "
                     f"Hard filter: {hard_sections or 'None'}"
                 )
-                for h in hits[:3]:  # top 3 chunks
+                for h in hits[:3]:
                     st.markdown(
                         f"**{h['filename']} – page {h['page']} – `{h.get('section','other')}`** "
-                        f"(score {h['score']:.3f})\n\n"
+                        f"(vec_score {h['score']:.3f} | rerank {h.get('rerank_score', 0):.3f})\n\n"
                         f"> {h['excerpt']}"
                     )
 
-        save_message(conversation_id, "assistant", response)
-
+        # Save VERIFIED answer (not the draft)
+        save_message(conversation_id, "assistant", verified)
 
     except AuthenticationError as e:
         st.error("OpenAI authentication failed. Check your API key in st.secrets.")
