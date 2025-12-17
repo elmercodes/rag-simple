@@ -1,0 +1,17 @@
+Things I'd like to do in order to make this a pro-level project
+
+-4  add a table where every user question is normalized and accumulates a score. This will help rank the most asked questions 
+    which will provide valuable information to employers regarding thier private doucumentation.
+
+-3  add user authentication in order to tie their account to their previous conversations.
+
+-5  update the UI so that instead of streamlit I use actual code to make the frontend better for users to use and look at.
+
+-2  make code compatible with open source models.
+
+-5  containerize with docker.
+
+-6  CI/CD with kubernetes.
+
+-1  have answers be correct or admit it doesn't know. Once pages are selected through RAG process, use output to tailor 
+    respones to question.
