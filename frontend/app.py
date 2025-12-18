@@ -26,7 +26,7 @@ from backend.app.db_init import init_db
 from backend.app.models import Conversation, Message  
 from backend.app.rerank import rerank
 from backend.app.retrieval_policy import classify_intent, preferred_sections, should_hard_filter
-from backend.app.vectorstore import ingest_pdf, retrieve_hits, build_context_and_sources
+from backend.app.vectorstore import ingest_file, retrieve_hits, build_context_and_sources
 from backend.app.verification import verify_answer
 
 
@@ -46,7 +46,7 @@ if "db_initialized" not in st.session_state:
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 if "openai_model" not in st.session_state:
-    st.session_state["openai_model"] = "gpt-5"
+    st.session_state["openai_model"] = "gpt-5-nano"
 
 # ------------------------------------------------------------------------------
 # DB HELPERS
@@ -162,8 +162,8 @@ st.sidebar.caption(
 )
 
 uploaded_files = st.sidebar.file_uploader(
-    "Upload PDFs",
-    type=["pdf"],
+    "Upload files",
+    type=["pdf", "txt", "docx"],
     accept_multiple_files=True,
 )
 
@@ -177,7 +177,7 @@ if uploaded_files:
             out.write(f.read())
 
         # Ingest into Chroma
-        doc_id = ingest_pdf(save_path)
+        doc_id = ingest_file(save_path)
         st.sidebar.success(f"Ingested {f.name} (doc_id={doc_id[:8]}...)")
 
 
@@ -294,67 +294,62 @@ if prompt:
     # Build context + top page sources + 
     context, sources, evidence_hits = build_context_and_sources(hits, top_pages=2)
 
-
-
-    # Build final messages for LLM
-    system_content = (
-        "You are a helpful assistant answering questions using ONLY the provided context. "
-        "If the answer is not explicitly supported by the context, say you can't find it.\n\n"
-        f"Context:\n{context}"
-        if context
-        else "You are a helpful assistant. There is no external context available."
-    )
-
-
-    messages = [
-        {"role": "system", "content": system_content},
-        *chat_history,
-    ]
-
-    # Optional debug
-    total_chars = sum(len(m["content"]) for m in messages)
-    total_msgs = len(messages)
-    st.sidebar.write(f"DEBUG: {total_msgs} msgs, ~{total_chars} chars total")
-
     try:
         with st.chat_message("assistant"):
             placeholder = st.empty()
 
-            # 1) Stream draft answer
-            stream = call_llm_with_retry(client, messages)
+            # ---------------- PASS 1: Generate best-effort paragraph from evidence ----------------
+            answer_system = (
+                "You are a helpful assistant answering questions using the provided document excerpts.\n"
+                "Write ONE clear paragraph.\n"
+                "You MAY use common sense to connect points and make reasonable assumptions IF they are consistent with the excerpts.\n"
+                "If you make an assumption, briefly signal it with a phrase like 'Likely' or 'It appears'.\n"
+                "Do NOT refuse unless the excerpts contain nothing relevant.\n\n"
+                f"DOCUMENT EXCERPTS:\n{context}"
+                if context
+                else "You are a helpful assistant. No document excerpts were provided."
+            )
+
+            answer_messages = [
+                {"role": "system", "content": answer_system},
+                *chat_history,
+                {"role": "user", "content": prompt},
+            ]
+
+            stream = call_llm_with_retry(client, answer_messages)
             draft = placeholder.write_stream(stream)
 
-            # 2) Verify against the SAME evidence you used for context
-            verified, vdebug = verify_answer(
-                draft,
-                evidence_hits,
-                support_threshold=0.78,
-                weak_threshold=0.70,
+            # ---------------- PASS 2: Less-strict check (answered? supported enough?) ----------------
+            final_answer, vdebug = verify_answer(
+                client=client,
+                model=st.session_state["openai_model"],
+                question=prompt,
+                draft=draft,
+                context=context,
+                evidence_hits=evidence_hits,
+                refusal_text="I can’t find a supported answer in the provided document excerpts.",
             )
 
-            # 3) Replace draft with verified answer
-            placeholder.markdown(verified)
+            placeholder.markdown(final_answer)
 
-            # 4) Show sources (top 2 pages you selected)
+            # ---------------- Sources (dedupe pages so you don't show same page twice) ----------------
             if sources:
                 st.markdown("### 📌 Sources")
+                seen = set()
                 for s in sources:
+                    key = (s["filename"], s["page"])
+                    if key in seen:
+                        continue
+                    seen.add(key)
                     st.markdown(f"- **{s['filename']}** — page {s['page']}")
 
-            # 5) Optional: verifier debug in sidebar
+            # Optional: verifier debug in sidebar
             st.sidebar.write(
-                f"Verifier: kept={vdebug.get('kept', 0)} | dropped={vdebug.get('dropped', 0)}"
+                f"Verifier: verdict={vdebug.get('verdict')} | confidence={vdebug.get('confidence')}"
             )
 
-            # Optional: show claim-level debug (toggle)
             with st.expander("Verifier details (debug)"):
-                for c in vdebug.get("claims", []):
-                    st.markdown(
-                        f"- **{c['status']}** (sim={c['similarity']:.3f}) "
-                        f"→ {c.get('best_file')} p.{c.get('best_page')}\n\n"
-                        f"  **Claim:** {c['claim']}\n\n"
-                        f"  **Best snippet:** {c['snippet']}"
-                    )
+                st.code(vdebug.get("raw", "")[:2000])
 
             # --- SHOW RETRIEVAL DEBUG (EXCERPTS) ---
             if hits:
@@ -370,8 +365,9 @@ if prompt:
                         f"> {h['excerpt']}"
                     )
 
-        # Save VERIFIED answer (not the draft)
-        save_message(conversation_id, "assistant", verified)
+        # Save FINAL answer
+        save_message(conversation_id, "assistant", final_answer)
+
 
     except AuthenticationError as e:
         st.error("OpenAI authentication failed. Check your API key in st.secrets.")

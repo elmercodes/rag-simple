@@ -1,12 +1,17 @@
 # backend/app/vectorstore.py
 import os
 import uuid
-from typing import List, Dict, Tuple
 from collections import defaultdict
 import re
 
 import chromadb
 from pypdf import PdfReader
+import hashlib
+from typing import Optional, Tuple, List, Dict
+
+from pypdf import PdfReader
+from docx import Document
+
 
 from .embeddings import embed_texts
 from .sectioning import detect_section_from_page_text
@@ -25,6 +30,69 @@ os.makedirs(VECTOR_DIR, exist_ok=True)
 # For now, keep it simple: one persistent Chroma client + collection
 _client = chromadb.PersistentClient(path=VECTOR_DIR)
 _collection = _client.get_or_create_collection("docs")
+
+# --------------------------------------------------------------------
+# HELPER FUNCTIONS
+# --------------------------------------------------------------------
+def _file_sha256(path: str, block_size: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(block_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def _stable_doc_id(path: str) -> str:
+    """
+    Stable doc_id so re-uploading same exact file doesn't create duplicates.
+    Uses SHA256(file bytes). Not a UUID.
+    """
+    return _file_sha256(path)
+
+def _delete_existing_doc(doc_id: str) -> None:
+    """
+    Remove existing chunks for this doc_id so re-ingesting updates cleanly.
+    """
+    try:
+        existing = _collection.get(where={"doc_id": doc_id})
+        if existing and existing.get("ids"):
+            _collection.delete(ids=existing["ids"])
+    except Exception:
+        # If collection.get(where=...) isn't supported by your Chroma version,
+        # we can swap to a query-based delete later. For now, fail-soft.
+        pass
+
+def _read_pdf_pages(path: str) -> List[Tuple[int, str]]:
+    reader = PdfReader(path)
+    pages = []
+    for page_idx, page in enumerate(reader.pages, start=1):
+        pages.append((page_idx, page.extract_text() or ""))
+    return pages
+
+def _read_txt_pages(path: str) -> List[Tuple[int, str]]:
+    # Treat as single "page" for now
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        text = f.read()
+    return [(1, text)]
+
+def _read_docx_pages(path: str) -> List[Tuple[int, str]]:
+    # DOCX doesn't have true pages easily without layout engine.
+    # Treat as one "page" and rely on chunking.
+    doc = Document(path)
+    paras = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
+    text = "\n".join(paras)
+    return [(1, text)]
+
+def _read_any_file(path: str) -> List[Tuple[int, str]]:
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".pdf":
+        return _read_pdf_pages(path)
+    if ext == ".txt":
+        return _read_txt_pages(path)
+    if ext == ".docx":
+        return _read_docx_pages(path)
+    raise ValueError(f"Unsupported file type: {ext}")
+
+
 
 
 # --------------------------------------------------------------------
@@ -80,40 +148,50 @@ def _chunk_text(text: str, chunk_size: int = 1200, overlap: int = 0) -> List[str
 # INGESTION
 # --------------------------------------------------------------------
 
-def ingest_pdf(path: str) -> str:
+def ingest_file(path: str) -> str:
     """
-    Read a PDF, chunk it, embed, and store in Chroma.
+    Read a file (PDF/TXT/DOCX), chunk it, embed it, and store in Chroma.
+
+    - Uses a stable doc_id based on file content hash to prevent duplicates.
+    - Deletes prior chunks for that doc_id before re-adding (update behavior).
 
     Returns:
-        doc_id (str): UUID for this document.
+        doc_id (str): stable id for this document.
     """
-    doc_id = str(uuid.uuid4())
+    doc_id = _stable_doc_id(path)
     filename = os.path.basename(path)
 
-    reader = PdfReader(path)
+    # Remove previously ingested chunks for this doc (so re-upload updates)
+    _delete_existing_doc(doc_id)
 
-    ids = []
-    docs = []
-    metas = []
+    ids: List[str] = []
+    docs: List[str] = []
+    metas: List[Dict] = []
 
     current_section = "other"
 
-    for page_idx, page in enumerate(reader.pages, start=1):
-        page_text = page.extract_text() or ""
+    # Read as list of (page_number, text)
+    pages = _read_any_file(path)
+
+    for page_idx, page_text in pages:
+        page_text = page_text or ""
+
+        # Optional section detection (works best for papers; for txt/docx usually stays "other")
         current_section = detect_section_from_page_text(
             page_text,
             current_section=current_section,
-            enable_paper_patterns=True,  # works for papers + general docs
+            enable_paper_patterns=True,
         )
 
         chunks = _chunk_text(page_text)
         for i, chunk in enumerate(chunks):
+            if not chunk or not chunk.strip():
+                continue
+
             chunk_id = str(uuid.uuid4())
             ids.append(chunk_id)
-
             docs.append(chunk)
 
-            # ---- NEW: better metadata ----
             preview = chunk.strip().replace("\n", " ")
             preview = preview[:200] + ("..." if len(preview) > 200 else "")
 
@@ -121,7 +199,7 @@ def ingest_pdf(path: str) -> str:
                 {
                     "doc_id": doc_id,
                     "filename": filename,
-                    "page": page_idx,
+                    "page": page_idx,          # pdf: real page; txt/docx: 1
                     "chunk_index": i,
                     "section": current_section,
                     "char_len": len(chunk),
@@ -129,8 +207,7 @@ def ingest_pdf(path: str) -> str:
                 }
             )
 
-
-    # No text? Still return doc_id so caller knows we "handled" it.
+    # No text? Still return doc_id so caller knows we handled it.
     if not docs:
         return doc_id
 
@@ -144,6 +221,7 @@ def ingest_pdf(path: str) -> str:
     )
 
     return doc_id
+
 
 
 # --------------------------------------------------------------------
@@ -201,6 +279,7 @@ def retrieve_context_and_sources(
 
     return context, sources
 
+
 def retrieve_hits(
     query: str,
     k: int = 30,
@@ -219,7 +298,7 @@ def retrieve_hits(
         query_embeddings=[q_vec],
         n_results=k,
         include=["documents", "metadatas", "distances"],
-        where=where,  # <-- this is the key change
+        where=where,
     )
 
     if not res["documents"] or not res["documents"][0]:
@@ -229,40 +308,44 @@ def retrieve_hits(
     metas = res["metadatas"][0]
     dists = res["distances"][0]
 
-    hits = []
+    hits: List[Dict] = []
+
     for doc, meta, dist in zip(docs, metas, dists):
         section = meta.get("section", "other")
 
-        # Base score from vector similarity
+        # --- base similarity score ---
         score = 1 / (1 + dist)
 
-        # --- RULE 2: DISCOUNT IMPACT SECTION FOR TECHNICAL CLAIMS ---
-        # (generalized "Broader Impact" rule)
+        # --- discount impact sections unless intent is impact ---
         if intent != "impact" and section == "impact":
             score *= 0.35
 
-        # --- RULE 1/3: EVIDENCE-TYPE MATCHING (SOFT BOOST/PENALTY) ---
+        # --- soft preference boost / penalty ---
         if preferred:
             if section in preferred:
                 score *= 1.25
             else:
                 score *= 0.90
 
-        excerpt = doc.strip().replace("\n", " ")
-        excerpt = excerpt[:300] + ("..." if len(excerpt) > 300 else "")
+        raw = doc  # raw chunk text
 
-        raw = doc  # doc is now raw chunk text
+        # Text passed to the LLM (grounded with metadata)
+        display_text = (
+            f"FILE: {meta.get('filename')}\n"
+            f"PAGE: {meta.get('page')}\n"
+            f"SECTION: {section}\n\n"
+            f"{raw}"
+        )
 
-        display_text = f"Document: {meta.get('filename')}\nPage: {meta.get('page')}\n\n{raw}"
-
+        # Short preview for UI
         excerpt = raw.strip().replace("\n", " ")
         excerpt = excerpt[:300] + ("..." if len(excerpt) > 300 else "")
 
         hits.append({
             "score": score,
-            "raw_text": raw,          # ✅ for rerank/verify
-            "text": display_text,     # ✅ for context shown to LLM (optional)
-            "excerpt": excerpt,       # ✅ for UI
+            "raw_text": raw,          # for rerank + verification
+            "text": display_text,     # for LLM context
+            "excerpt": excerpt,       # for UI
             "filename": meta.get("filename"),
             "page": meta.get("page"),
             "doc_id": meta.get("doc_id"),
@@ -270,54 +353,77 @@ def retrieve_hits(
             "section": section,
         })
 
-
     hits.sort(key=lambda h: h["score"], reverse=True)
-
     return hits
-
 
 
 def build_context_and_sources(
     hits: List[Dict],
     top_pages: int = 2,
     chunks_per_page: int = 4,
-) -> Tuple[str, List[Dict]]:
+) -> Tuple[str, List[Dict], List[Dict]]:
     """
     Page-first selection using rerank_score when present.
-    Then build context ONLY from chunks on selected pages.
+    Builds context ONLY from chunks on selected pages.
+    Returns: (context, sources, selected_hits)
     """
 
     if not hits:
-        return "", []
+        return "", [], []
 
-    # Use rerank_score if available, else fall back to score
-    def s(h: Dict) -> float:
+    # Prefer rerank_score when available
+    def score_fn(h: Dict) -> float:
         return float(h.get("rerank_score", h.get("score", 0.0)))
 
-    # 1) Aggregate score by (doc_id, filename, page)
+    # 1) Aggregate scores by page
     page_scores = defaultdict(float)
     page_to_hits = defaultdict(list)
 
     for h in hits:
         key = (h["doc_id"], h["filename"], h["page"])
-        page_scores[key] += s(h)
+        page_scores[key] += score_fn(h)
         page_to_hits[key].append(h)
 
-    # 2) Pick top pages
-    best_pages = sorted(page_scores.items(), key=lambda x: x[1], reverse=True)[:top_pages]
+    # 2) Select top pages
+    best_pages = sorted(
+        page_scores.items(),
+        key=lambda x: x[1],
+        reverse=True
+    )[:top_pages]
+
     selected_page_keys = [k for (k, _) in best_pages]
 
-    sources = [{"doc_id": k[0], "filename": k[1], "page": k[2]} for k in selected_page_keys]
-
-    # 3) Build context: only from selected pages, best chunks first
-    selected_hits = []
+    # --- DEDUPE page keys ---
+    seen = set()
+    deduped_page_keys = []
     for k in selected_page_keys:
-        page_hits = sorted(page_to_hits[k], key=s, reverse=True)[:chunks_per_page]
+        if k in seen:
+            continue
+        seen.add(k)
+        deduped_page_keys.append(k)
+
+    selected_page_keys = deduped_page_keys
+
+    # 3) Build sources list
+    sources = [
+        {"doc_id": k[0], "filename": k[1], "page": k[2]}
+        for k in selected_page_keys
+    ]
+
+    # 4) Collect best chunks from selected pages
+    selected_hits: List[Dict] = []
+    for k in selected_page_keys:
+        page_hits = sorted(
+            page_to_hits[k],
+            key=score_fn,
+            reverse=True
+        )[:chunks_per_page]
         selected_hits.extend(page_hits)
 
-    # Keep overall ordering by score
-    selected_hits.sort(key=s, reverse=True)
+    # Keep overall order stable
+    selected_hits.sort(key=score_fn, reverse=True)
 
-    context = "\n\n---\n\n".join([h["text"] for h in selected_hits])
+    # 5) Build LLM context
+    context = "\n\n---\n\n".join(h["text"] for h in selected_hits)
+
     return context, sources, selected_hits
-
