@@ -1,132 +1,96 @@
 import re
-from typing import List, Dict, Tuple
 
-from .embeddings import embed_texts
+DEFAULT_REFUSAL = "I can’t find a supported answer in the provided document excerpts."
 
-def _split_claims(text: str) -> List[str]:
-    """
-    Simple claim splitter:
-    - splits bullets and sentences
-    - removes tiny fragments
-    """
-    if not text:
-        return []
-
-    # normalize bullets
-    text = text.replace("\r", "\n")
-    parts = []
-
-    # split by bullet lines first
-    for line in text.split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-        if line.startswith(("-", "*")):
-            line = line.lstrip("-* ").strip()
-        parts.append(line)
-
-    # then split by sentence boundaries
-    claims = []
-    for p in parts:
-        # naive sentence split
-        for s in re.split(r"(?<=[.!?])\s+", p):
-            s = s.strip()
-            if len(s) >= 25:  # filter tiny fragments
-                claims.append(s)
-
-    # de-duplicate
-    seen = set()
-    out = []
-    for c in claims:
-        key = c.lower()
-        if key not in seen:
-            seen.add(key)
-            out.append(c)
-    return out
-
-
-def _cosine(a: List[float], b: List[float]) -> float:
-    # safe cosine; assumes embeddings are non-zero
-    import math
-    dot = sum(x*y for x, y in zip(a, b))
-    na = math.sqrt(sum(x*x for x in a))
-    nb = math.sqrt(sum(y*y for y in b))
-    if na == 0 or nb == 0:
-        return 0.0
-    return dot / (na * nb)
-
+def _trim(text: str, max_chars: int = 7000) -> str:
+    return (text or "")[:max_chars]
 
 def verify_answer(
-    answer_text: str,
-    evidence_hits: List[Dict],
-    support_threshold: float = 0.78,
-    weak_threshold: float = 0.70,
-    max_snippet_chars: int = 220,
-) -> Tuple[str, Dict]:
+    *,
+    client,
+    model: str,
+    question: str,
+    draft: str,
+    context: str,
+    evidence_hits,
+    refusal_text: str = DEFAULT_REFUSAL,
+):
     """
-    Verifies answer claims against evidence_hits (ONLY the hits you used to build context).
-    Returns (verified_answer, debug_info)
-
-    evidence_hits must contain:
-      - "text" (chunk)
+    Less-strict verifier:
+    - Allows common-sense linking + reasonable assumptions consistent with excerpts
+    - Focuses on: does it answer the QUESTION, and is it supported enough?
+    Returns (final_answer, debug_dict)
     """
-    claims = _split_claims(answer_text)
-    if not claims or not evidence_hits:
-        return answer_text, {"claims": [], "kept": 0, "dropped": 0}
 
-    # Embed evidence chunks once
-    evidence_texts = [h.get("raw_text", h["text"]) for h in evidence_hits]
-    evidence_vecs = embed_texts(evidence_texts)
+    # Keep the excerpt payload bounded for cost / context
+    excerpts = _trim(context, 7000)
 
-    kept = []
-    debug_claims = []
+    judge_system = (
+        "You are a judge evaluating whether an answer is supported by the provided document excerpts.\n"
+        "Be strict enough to avoid hallucinations, but NOT overly strict.\n"
+        "The assistant is allowed to use common sense and make reasonable assumptions ONLY if they are consistent with the excerpts.\n\n"
+        "Your job:\n"
+        "1) Decide if the DRAFT answers the QUESTION.\n"
+        "2) Decide if the DRAFT is supported by the EXCERPTS.\n\n"
+        "Verdicts:\n"
+        "- SUPPORTED: answers the question and is supported (paraphrase ok).\n"
+        "- PARTIAL: some support exists, but incomplete or slightly speculative. Rewrite to hedge and be precise.\n"
+        "- UNSUPPORTED: not enough support to answer. Use the refusal text.\n\n"
+        "Output format EXACTLY:\n"
+        "VERDICT: <SUPPORTED|PARTIAL|UNSUPPORTED>\n"
+        "CONFIDENCE: <0.00-1.00>\n"
+        "FINAL: <one paragraph final answer>\n"
+    )
 
-    # Embed claims in a batch
-    claim_vecs = embed_texts(claims)
+    judge_user = (
+        f"REFUSAL_TEXT:\n{refusal_text}\n\n"
+        f"QUESTION:\n{question}\n\n"
+        f"DRAFT:\n{draft}\n\n"
+        f"EXCERPTS:\n{excerpts}\n"
+    )
 
-    for claim, cvec in zip(claims, claim_vecs):
-        best_i = -1
-        best_sim = -1.0
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": judge_system},
+            {"role": "user", "content": judge_user},
+        ],
+        stream=False,
+    )
 
-        for i, evec in enumerate(evidence_vecs):
-            sim = _cosine(cvec, evec)
-            if sim > best_sim:
-                best_sim = sim
-                best_i = i
+    text = resp.choices[0].message.content or ""
 
-        if best_i >= 0:
-            best_hit = evidence_hits[best_i]
-            snippet = best_hit["text"].strip().replace("\n", " ")
-            snippet = snippet[:max_snippet_chars] + ("..." if len(snippet) > max_snippet_chars else "")
+    verdict = "UNSUPPORTED"
+    confidence = 0.0
+    final = refusal_text
 
-            if best_sim >= support_threshold:
-                kept.append(claim)
-                status = "supported"
-            elif best_sim >= weak_threshold:
-                # keep but hedge
-                kept.append(f"(Possibly) {claim}")
-                status = "weak"
-            else:
-                status = "unsupported"
+    m_v = re.search(r"VERDICT:\s*(SUPPORTED|PARTIAL|UNSUPPORTED)", text)
+    if m_v:
+        verdict = m_v.group(1)
 
-            debug_claims.append({
-                "claim": claim,
-                "status": status,
-                "similarity": float(best_sim),
-                "best_page": best_hit.get("page"),
-                "best_file": best_hit.get("filename"),
-                "snippet": snippet,
-            })
+    m_c = re.search(r"CONFIDENCE:\s*([0-1](?:\.\d+)?)", text)
+    if m_c:
+        try:
+            confidence = float(m_c.group(1))
+        except:
+            confidence = 0.0
 
-    if not kept:
-        # hard refuse if nothing is grounded
-        verified = "I can’t find a supported answer in the provided document excerpts."
-    else:
-        verified = "\n".join(f"- {k}" for k in kept)
+    m_f = re.search(r"FINAL:\s*(.*)$", text, flags=re.S)
+    if m_f:
+        final = m_f.group(1).strip()
+
+    # Safety fallbacks:
+    if not final:
+        final = refusal_text if verdict == "UNSUPPORTED" else (draft or "")
+
+    # IMPORTANT: if verdict is PARTIAL, never hard-refuse.
+    # Keep a hedged answer instead.
+    if verdict == "PARTIAL" and final.strip() == refusal_text:
+        final = draft
 
     debug = {
-        "claims": debug_claims,
-        "kept": len(kept),
-        "dropped": len([c for c in debug_claims if c["status"] == "unsupported"]),
+        "verdict": verdict,
+        "confidence": confidence,
+        "raw": text,
     }
-    return verified, debug
+    return final, debug
