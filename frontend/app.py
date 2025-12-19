@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import streamlit as st
@@ -23,9 +24,13 @@ if PROJECT_ROOT not in sys.path:
 
 from backend.app.db import SessionLocal, engine
 from backend.app.db_init import init_db         
-from backend.app.models import Conversation, Message  
+from backend.app.models import Conversation, Message, RoutingDecision  
 from backend.app.rerank import rerank
-from backend.app.retrieval_policy import classify_intent, preferred_sections, should_hard_filter
+from backend.app.retrieval_policy import (
+    classify_intent,
+    preferred_sections,
+    should_hard_filter,
+)
 from backend.app.vectorstore import ingest_file, retrieve_hits, build_context_and_sources
 from backend.app.verification import verify_answer
 
@@ -48,15 +53,25 @@ client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 if "openai_model" not in st.session_state:
     st.session_state["openai_model"] = "gpt-5-nano"
 
-# ------------------------------------------------------------------------------
-# DB HELPERS
-# ------------------------------------------------------------------------------
+# Sticky toggle for RAG vs AI-only (defaults to ON to preserve current behavior)
+if "use_documents" not in st.session_state:
+    st.session_state["use_documents"] = True
+
+# -------------------- DB Helpers --------------------
+
+@contextmanager
+def db_session():
+    """Shared session helper to ensure connections are always closed."""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 
 def create_conversation() -> int:
     """Create a new conversation row and return its id."""
-    db = SessionLocal()
-    try:
+    with db_session() as db:
         conv = Conversation(
             title=f"Session {datetime.now(timezone.utc).isoformat(timespec='minutes')}"
         )
@@ -64,26 +79,20 @@ def create_conversation() -> int:
         db.commit()
         db.refresh(conv)
         return conv.id
-    finally:
-        db.close()
 
 
 def list_conversations(limit: int = 20):
-    db = SessionLocal()
-    try:
+    with db_session() as db:
         return (
             db.query(Conversation)
             .order_by(Conversation.created_at.desc())
             .limit(limit)
             .all()
         )
-    finally:
-        db.close()
 
 
 def load_conversation_messages(conversation_id: int):
-    db = SessionLocal()
-    try:
+    with db_session() as db:
         conv = (
             db.query(Conversation)
             .filter(Conversation.id == conversation_id)
@@ -92,13 +101,10 @@ def load_conversation_messages(conversation_id: int):
         if not conv:
             return []
         return conv.messages
-    finally:
-        db.close()
 
 
 def save_message(conversation_id: int, role: str, content: str):
-    db = SessionLocal()
-    try:
+    with db_session() as db:
         msg = Message(
             conversation_id=conversation_id,
             role=role,     # 'user' or 'assistant'
@@ -108,13 +114,27 @@ def save_message(conversation_id: int, role: str, content: str):
         db.commit()
         db.refresh(msg)
         return msg
-    finally:
-        db.close()
+
+
+def save_routing_decision(message_id: int, answer_mode: str, reason: str, confidence: float):
+    """
+    Persist router decision alongside the assistant message for observability.
+    """
+    with db_session() as db:
+        decision = RoutingDecision(
+            message_id=message_id,
+            answer_mode=answer_mode,
+            reason=reason,
+            confidence=confidence,
+        )
+        db.add(decision)
+        db.commit()
+        db.refresh(decision)
+        return decision
 
 
 def update_conversation_title(conversation_id: int, new_title: str):
-    db = SessionLocal()
-    try:
+    with db_session() as db:
         conv = (
             db.query(Conversation)
             .filter(Conversation.id == conversation_id)
@@ -123,8 +143,6 @@ def update_conversation_title(conversation_id: int, new_title: str):
         if conv:
             conv.title = new_title
             db.commit()
-    finally:
-        db.close()
 
 
 # ------------------------------------------------------------------------------
@@ -151,6 +169,16 @@ def call_llm_with_retry(client: OpenAI, messages, max_retries: int = 2):
 # ------------------------------------------------------------------------------
 
 st.title("Converse With Your Documents")
+
+# ---------- Sidebar: answer mode toggle ----------
+st.sidebar.subheader("Answer mode")
+use_documents = st.sidebar.toggle(
+    "Use Documents",
+    value=st.session_state["use_documents"],
+    key="use_documents",
+    help="Turn off to answer with the AI only (no document retrieval).",
+)
+st.sidebar.caption(f"Use Documents is {'ON' if use_documents else 'OFF'}.")
 
 # ---------- Sidebar: conversations ----------
 st.sidebar.header("Documents")
@@ -270,103 +298,148 @@ if prompt:
         for m in trimmed
     ]
 
-    # -------------------- Retrieval policy (intent -> sections) --------------------
-    intent = classify_intent(prompt)
-    preferred = preferred_sections(intent)
-
-    hard_sections = None
-    if should_hard_filter(intent) and preferred:
-        # hard filter only for intents we consider "safe" to restrict
-        hard_sections = preferred
-
-    # Retrieve more candidates (policy-aware)
-    hits = retrieve_hits(
-        prompt,
-        k=30,
-        intent=intent,
-        hard_sections=hard_sections,
-        preferred=preferred,
+    # -------------------- Routing: toggle decides RAG vs AI-only --------------------
+    answer_mode = "rag" if st.session_state["use_documents"] else "direct"
+    mode_badge = (
+        f"Mode: {answer_mode.upper()} | conf {1.0:.2f} | "
+        f"Use Documents: {'ON' if st.session_state['use_documents'] else 'OFF'}"
     )
-
-    # Rerank AFTER policy scoring
-    hits = rerank(prompt, hits, top_n=18)
-
-    # Build context + top page sources + 
-    context, sources, evidence_hits = build_context_and_sources(hits, top_pages=2)
+    mode_reason = (
+        "User selected Use Documents toggle."
+        if st.session_state["use_documents"]
+        else "User turned off Use Documents toggle; retrieval skipped."
+    )
 
     try:
         with st.chat_message("assistant"):
+            st.caption(f"{mode_badge} — {mode_reason}")
             placeholder = st.empty()
 
-            # ---------------- PASS 1: Generate best-effort paragraph from evidence ----------------
-            answer_system = (
-                "You are a helpful assistant answering questions using the provided document excerpts.\n"
-                "Write ONE clear paragraph.\n"
-                "You MAY use common sense to connect points and make reasonable assumptions IF they are consistent with the excerpts.\n"
-                "If you make an assumption, briefly signal it with a phrase like 'Likely' or 'It appears'.\n"
-                "Do NOT refuse unless the excerpts contain nothing relevant.\n\n"
-                f"DOCUMENT EXCERPTS:\n{context}"
-                if context
-                else "You are a helpful assistant. No document excerpts were provided."
-            )
-
-            answer_messages = [
-                {"role": "system", "content": answer_system},
-                *chat_history,
-                {"role": "user", "content": prompt},
-            ]
-
-            stream = call_llm_with_retry(client, answer_messages)
-            draft = placeholder.write_stream(stream)
-
-            # ---------------- PASS 2: Less-strict check (answered? supported enough?) ----------------
-            final_answer, vdebug = verify_answer(
-                client=client,
-                model=st.session_state["openai_model"],
-                question=prompt,
-                draft=draft,
-                context=context,
-                evidence_hits=evidence_hits,
-                refusal_text="I can’t find a supported answer in the provided document excerpts.",
-            )
-
-            placeholder.markdown(final_answer)
-
-            # ---------------- Sources (dedupe pages so you don't show same page twice) ----------------
-            if sources:
-                st.markdown("### 📌 Sources")
-                seen = set()
-                for s in sources:
-                    key = (s["filename"], s["page"])
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    st.markdown(f"- **{s['filename']}** — page {s['page']}")
-
-            # Optional: verifier debug in sidebar
-            st.sidebar.write(
-                f"Verifier: verdict={vdebug.get('verdict')} | confidence={vdebug.get('confidence')}"
-            )
-
-            with st.expander("Verifier details (debug)"):
-                st.code(vdebug.get("raw", "")[:2000])
-
-            # --- SHOW RETRIEVAL DEBUG (EXCERPTS) ---
-            if hits:
-                st.markdown("### 🔍 Retrieved evidence")
-                st.caption(
-                    f"Intent: `{intent}` | Preferred: {preferred or 'None'} | "
-                    f"Hard filter: {hard_sections or 'None'}"
+            if answer_mode == "direct":
+                direct_system = (
+                    "You are a helpful assistant. Answer the user concisely and accurately.\n"
+                    "If the question actually requires document-specific facts, ask to look at the uploaded documents."
                 )
-                for h in hits[:3]:
-                    st.markdown(
-                        f"**{h['filename']} – page {h['page']} – `{h.get('section','other')}`** "
-                        f"(vec_score {h['score']:.3f} | rerank {h.get('rerank_score', 0):.3f})\n\n"
-                        f"> {h['excerpt']}"
+                direct_messages = [
+                    {"role": "system", "content": direct_system},
+                    *chat_history,
+                    {"role": "user", "content": prompt},
+                ]
+
+                stream = call_llm_with_retry(client, direct_messages)
+                direct_answer = placeholder.write_stream(stream)
+
+                # Subtle note when AI-only mode is selected by the user.
+                note = (
+                    "_AI-only (documents not used)._"
+                    if not st.session_state["use_documents"]
+                    else "_Answered without document retrieval._"
+                )
+                final_answer = f"{direct_answer}\n\n{note}"
+                placeholder.markdown(final_answer)
+
+                sources = []
+
+            else:
+                # -------------------- Retrieval policy (intent -> sections) --------------------
+                intent = classify_intent(prompt)
+                preferred = preferred_sections(intent)
+
+                hard_sections = None
+                if should_hard_filter(intent) and preferred:
+                    # hard filter only for intents we consider "safe" to restrict
+                    hard_sections = preferred
+
+                # Retrieve more candidates (policy-aware)
+                hits = retrieve_hits(
+                    prompt,
+                    k=30,
+                    intent=intent,
+                    hard_sections=hard_sections,
+                    preferred=preferred,
+                )
+
+                # Rerank AFTER policy scoring
+                hits = rerank(prompt, hits, top_n=18)
+
+                # Build context + top page sources +
+                context, sources, evidence_hits = build_context_and_sources(hits, top_pages=2)
+
+                # ---------------- PASS 1: Generate best-effort paragraph from evidence ----------------
+                answer_system = (
+                    "You are a helpful assistant answering questions using the provided document excerpts.\n"
+                    "Write ONE clear paragraph.\n"
+                    "You MAY use common sense to connect points and make reasonable assumptions IF they are consistent with the excerpts.\n"
+                    "If you make an assumption, briefly signal it with a phrase like 'Likely' or 'It appears'.\n"
+                    "Do NOT refuse unless the excerpts contain nothing relevant.\n\n"
+                    f"DOCUMENT EXCERPTS:\n{context}"
+                    if context
+                    else "You are a helpful assistant. No document excerpts were provided."
+                )
+
+                answer_messages = [
+                    {"role": "system", "content": answer_system},
+                    *chat_history,
+                    {"role": "user", "content": prompt},
+                ]
+
+                stream = call_llm_with_retry(client, answer_messages)
+                draft = placeholder.write_stream(stream)
+
+                # ---------------- PASS 2: Less-strict check (answered? supported enough?) ----------------
+                final_answer, vdebug = verify_answer(
+                    client=client,
+                    model=st.session_state["openai_model"],
+                    question=prompt,
+                    draft=draft,
+                    context=context,
+                    evidence_hits=evidence_hits,
+                    refusal_text="I can’t find a supported answer in the provided document excerpts.",
+                )
+
+                placeholder.markdown(final_answer)
+
+                # ---------------- Sources (dedupe pages so you don't show same page twice) ----------------
+                if sources:
+                    st.markdown("### 📌 Sources")
+                    seen = set()
+                    for s in sources:
+                        key = (s["filename"], s["page"])
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        st.markdown(f"- **{s['filename']}** — page {s['page']}")
+
+                # Optional: verifier debug in sidebar
+                st.sidebar.write(
+                    f"Verifier: verdict={vdebug.get('verdict')} | confidence={vdebug.get('confidence')}"
+                )
+
+                with st.expander("Verifier details (debug)"):
+                    st.code(vdebug.get("raw", "")[:2000])
+
+                # --- SHOW RETRIEVAL DEBUG (EXCERPTS) ---
+                if hits:
+                    st.markdown("### 🔍 Retrieved evidence")
+                    st.caption(
+                        f"Intent: `{intent}` | Preferred: {preferred or 'None'} | "
+                        f"Hard filter: {hard_sections or 'None'}"
                     )
+                    for h in hits[:3]:
+                        st.markdown(
+                            f"**{h['filename']} – page {h['page']} – `{h.get('section','other')}`** "
+                            f"(vec_score {h['score']:.3f} | rerank {h.get('rerank_score', 0):.3f})\n\n"
+                            f"> {h['excerpt']}"
+                        )
 
         # Save FINAL answer
-        save_message(conversation_id, "assistant", final_answer)
+        assistant_msg = save_message(conversation_id, "assistant", final_answer)
+        save_routing_decision(
+            message_id=assistant_msg.id,
+            answer_mode=answer_mode,
+            reason=mode_reason,
+            confidence=1.0,
+        )
 
 
     except AuthenticationError as e:

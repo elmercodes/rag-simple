@@ -12,6 +12,5 @@ Things I'd like to do in order to make this a pro-level project
 -5  containerize with docker.
 
 -6  CI/CD with kubernetes.
-
--1  have answers be correct or admit it doesn't know. Once pages are selected through RAG process, use output to tailor 
-    respones to question.
+ 
+-1  make it so that ai understands wether a question is being asked that requires the docs or the ai's ability itself
