@@ -5,12 +5,11 @@ Things I'd like to do in order to make this a pro-level project
 
 -3  add user authentication in order to tie their account to their previous conversations.
 
--5  update the UI so that instead of streamlit I use actual code to make the frontend better for users to use and look at.
+-5  update the UI so that instead of streamlit I use actual code to make the frontend better for users to use and look at. Also fix the toggle button bug (cant be on without doucuments)
 
 -2  make code compatible with open source models.
 
--5  containerize with docker.
+-6  containerize with docker.
 
--6  CI/CD with kubernetes.
+-7  CI/CD with kubernetes.
  
--1  make it so that ai understands wether a question is being asked that requires the docs or the ai's ability itself
