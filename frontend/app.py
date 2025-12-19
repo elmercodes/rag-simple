@@ -103,12 +103,13 @@ def load_conversation_messages(conversation_id: int):
         return conv.messages
 
 
-def save_message(conversation_id: int, role: str, content: str):
+def save_message(conversation_id: int, role: str, content: str, meta: dict | None = None):
     with db_session() as db:
         msg = Message(
             conversation_id=conversation_id,
             role=role,     # 'user' or 'assistant'
             content=content,
+            meta=meta if meta is not None else None,
         )
         db.add(msg)
         db.commit()
@@ -143,6 +144,27 @@ def update_conversation_title(conversation_id: int, new_title: str):
         if conv:
             conv.title = new_title
             db.commit()
+
+
+def build_retrieved_excerpts(hits: list[dict]) -> list[dict]:
+    """
+    Normalize the top-3 hits into a stable structure stored on assistant messages.
+    """
+    excerpts: list[dict] = []
+    for idx, h in enumerate(hits[:3], start=1):
+        if not h:
+            continue
+        excerpts.append(
+            {
+                "rank": idx,
+                "attachment_id": h.get("doc_id"),
+                "doc_name": h.get("filename"),
+                "page": h.get("page"),
+                "text": h.get("excerpt"),
+                "source_ref": h.get("chunk_index"),
+            }
+        )
+    return excerpts
 
 
 # ------------------------------------------------------------------------------
@@ -275,6 +297,21 @@ history = load_conversation_messages(conversation_id)
 for msg in history:
     with st.chat_message(msg.role):
         st.write(msg.content)
+        if msg.role == "assistant":
+            meta = msg.meta or {}
+            excerpts = meta.get("retrieved_excerpts") or []
+            if meta.get("used_docs") and excerpts:
+                st.markdown("### Relevant excerpts")
+                for ex in excerpts:
+                    location = ""
+                    if ex.get("doc_name"):
+                        location = ex["doc_name"]
+                        if ex.get("page"):
+                            location += f" — page {ex['page']}"
+                    prefix = f"{ex.get('rank', 0)}."
+                    if location:
+                        prefix = f"{ex.get('rank', 0)}. {location}"
+                    st.markdown(f"{prefix}\n\n> {ex.get('text', '')}")
 
 
 # New message from user
@@ -305,6 +342,11 @@ if prompt:
         if st.session_state["use_documents"]
         else "User turned off Use Documents toggle; retrieval skipped."
     )
+    meta_data = {
+        "used_docs": bool(st.session_state["use_documents"]),
+        "retrieved_excerpts": [],
+    }
+    retrieved_excerpts: list[dict] = []
 
     try:
         with st.chat_message("assistant"):
@@ -333,8 +375,6 @@ if prompt:
                 final_answer = f"{direct_answer}\n\n{note}"
                 placeholder.markdown(final_answer)
 
-                sources = []
-
             else:
                 # -------------------- Retrieval policy (intent -> sections) --------------------
                 intent = classify_intent(prompt)
@@ -358,7 +398,7 @@ if prompt:
                 hits = rerank(prompt, hits, top_n=18)
 
                 # Build context + top page sources +
-                context, sources, evidence_hits = build_context_and_sources(hits, top_pages=2)
+                context, _sources, evidence_hits = build_context_and_sources(hits, top_pages=2)
 
                 # ---------------- PASS 1: Generate best-effort paragraph from evidence ----------------
                 answer_system = (
@@ -394,24 +434,32 @@ if prompt:
 
                 placeholder.markdown(final_answer)
 
+                retrieved_excerpts = build_retrieved_excerpts(hits)
+                meta_data["retrieved_excerpts"] = retrieved_excerpts
+
                 # --- Supporting excerpts (user-facing) ---
-                if hits:
+                if retrieved_excerpts:
                     st.markdown("### Relevant excerpts")
-                    for idx, h in enumerate(hits[:3], start=1):
+                    for ex in retrieved_excerpts:
                         location = ""
-                        if h.get("filename"):
-                            location = f"{h['filename']}"
-                            if h.get("page"):
-                                location += f" — page {h['page']}"
-                        prefix = f"{idx}."
+                        if ex.get("doc_name"):
+                            location = f"{ex['doc_name']}"
+                            if ex.get("page"):
+                                location += f" — page {ex['page']}"
+                        prefix = f"{ex.get('rank', 0)}."
                         if location:
-                            prefix = f"{idx}. {location}"
+                            prefix = f"{ex.get('rank', 0)}. {location}"
                         st.markdown(
-                            f"{prefix}\n\n> {h['excerpt']}"
+                            f"{prefix}\n\n> {ex.get('text', '')}"
                         )
 
         # Save FINAL answer
-        assistant_msg = save_message(conversation_id, "assistant", final_answer)
+        assistant_msg = save_message(
+            conversation_id,
+            "assistant",
+            final_answer,
+            meta=meta_data,
+        )
         save_routing_decision(
             message_id=assistant_msg.id,
             answer_mode=answer_mode,

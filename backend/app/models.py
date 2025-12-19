@@ -1,5 +1,5 @@
 # backend/app/models.py
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Float
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Float, JSON
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from .db import Base
@@ -41,6 +41,7 @@ class Message(Base):
     role = Column(String(10))  # 'user' or 'assistant'
     content = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+    meta = Column(JSON, nullable=True)  # structured per-message metadata (e.g., retrieved excerpts)
 
     conversation = relationship("Conversation", back_populates="messages")
     routing_decision = relationship(
