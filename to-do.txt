@@ -9,8 +9,7 @@ Things I'd like to do in order to make this a pro-level project
 
 -2  make code compatible with open source models.
 
--5  containerize with docker.
+-6  containerize with docker.
 
--6  CI/CD with kubernetes.
+-7  CI/CD with kubernetes.
  
--1  make it so that ai understands wether a question is being asked that requires the docs or the ai's ability itself

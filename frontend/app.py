@@ -300,10 +300,6 @@ if prompt:
 
     # -------------------- Routing: toggle decides RAG vs AI-only --------------------
     answer_mode = "rag" if st.session_state["use_documents"] else "direct"
-    mode_badge = (
-        f"Mode: {answer_mode.upper()} | conf {1.0:.2f} | "
-        f"Use Documents: {'ON' if st.session_state['use_documents'] else 'OFF'}"
-    )
     mode_reason = (
         "User selected Use Documents toggle."
         if st.session_state["use_documents"]
@@ -312,7 +308,6 @@ if prompt:
 
     try:
         with st.chat_message("assistant"):
-            st.caption(f"{mode_badge} — {mode_reason}")
             placeholder = st.empty()
 
             if answer_mode == "direct":
@@ -399,37 +394,20 @@ if prompt:
 
                 placeholder.markdown(final_answer)
 
-                # ---------------- Sources (dedupe pages so you don't show same page twice) ----------------
-                if sources:
-                    st.markdown("### 📌 Sources")
-                    seen = set()
-                    for s in sources:
-                        key = (s["filename"], s["page"])
-                        if key in seen:
-                            continue
-                        seen.add(key)
-                        st.markdown(f"- **{s['filename']}** — page {s['page']}")
-
-                # Optional: verifier debug in sidebar
-                st.sidebar.write(
-                    f"Verifier: verdict={vdebug.get('verdict')} | confidence={vdebug.get('confidence')}"
-                )
-
-                with st.expander("Verifier details (debug)"):
-                    st.code(vdebug.get("raw", "")[:2000])
-
-                # --- SHOW RETRIEVAL DEBUG (EXCERPTS) ---
+                # --- Supporting excerpts (user-facing) ---
                 if hits:
-                    st.markdown("### 🔍 Retrieved evidence")
-                    st.caption(
-                        f"Intent: `{intent}` | Preferred: {preferred or 'None'} | "
-                        f"Hard filter: {hard_sections or 'None'}"
-                    )
-                    for h in hits[:3]:
+                    st.markdown("### Relevant excerpts")
+                    for idx, h in enumerate(hits[:3], start=1):
+                        location = ""
+                        if h.get("filename"):
+                            location = f"{h['filename']}"
+                            if h.get("page"):
+                                location += f" — page {h['page']}"
+                        prefix = f"{idx}."
+                        if location:
+                            prefix = f"{idx}. {location}"
                         st.markdown(
-                            f"**{h['filename']} – page {h['page']} – `{h.get('section','other')}`** "
-                            f"(vec_score {h['score']:.3f} | rerank {h.get('rerank_score', 0):.3f})\n\n"
-                            f"> {h['excerpt']}"
+                            f"{prefix}\n\n> {h['excerpt']}"
                         )
 
         # Save FINAL answer
