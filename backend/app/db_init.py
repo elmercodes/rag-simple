@@ -1,17 +1,11 @@
 # backend/app/db_init.py
-from .migrations import run_migrations, ensure_default_user
 
+from .db import Base, engine
+from . import models  # ensures SQLAlchemy loads Conversation + Message classes
 
-def init_db() -> int:
+def init_db():
     """
-    Run idempotent migrations and return the default user id.
+    Creates database tables if they do not already exist.
+    This function is safe to run multiple times.
     """
-    return run_migrations()
-
-
-def get_default_user_id() -> int:
-    """
-    Convenience helper for callers that need the local user id
-    without rerunning migrations.
-    """
-    return ensure_default_user()
+    Base.metadata.create_all(bind=engine)
