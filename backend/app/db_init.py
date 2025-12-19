@@ -1,28 +1,17 @@
 # backend/app/db_init.py
-
-from sqlalchemy import inspect, text
-
-from .db import Base, engine
-from . import models  # ensures SQLAlchemy loads Conversation + Message classes
+from .migrations import run_migrations, ensure_default_user
 
 
-def _ensure_meta_column():
+def init_db() -> int:
     """
-    Lightweight migration to add messages.meta JSON column if missing.
-    Safe to run repeatedly.
+    Run idempotent migrations and return the default user id.
     """
-    inspector = inspect(engine)
-    columns = [c["name"] for c in inspector.get_columns("messages")]
-    if "meta" not in columns:
-        with engine.connect() as conn:
-            conn.execute(text("ALTER TABLE messages ADD COLUMN meta JSON"))
-            conn.commit()
+    return run_migrations()
 
 
-def init_db():
+def get_default_user_id() -> int:
     """
-    Creates database tables if they do not already exist.
-    This function is safe to run multiple times.
+    Convenience helper for callers that need the local user id
+    without rerunning migrations.
     """
-    Base.metadata.create_all(bind=engine)
-    _ensure_meta_column()
+    return ensure_default_user()

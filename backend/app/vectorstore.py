@@ -11,6 +11,8 @@ from docx import Document
 
 from .embeddings import embed_texts
 from .sectioning import detect_section_from_page_text
+from .db import SessionLocal
+from .models import Document as DocumentModel, DocumentChunk
 
 
 # -------------------- Paths & Client --------------------
@@ -24,6 +26,24 @@ os.makedirs(VECTOR_DIR, exist_ok=True)
 # For now, keep it simple: one persistent Chroma client + collection
 _client = chromadb.PersistentClient(path=VECTOR_DIR)
 _collection = _client.get_or_create_collection("docs")
+
+
+def _db_session():
+    return SessionLocal()
+
+
+def _scoped_where(conversation_id: int, user_id: int, extra: Dict | None = None) -> Dict:
+    """
+    Build a Chroma where clause that always scopes to conversation + user.
+    Chroma expects a single top-level operator, so we use $and.
+    """
+    clauses = [
+        {"conversation_id": conversation_id},
+        {"user_id": user_id},
+    ]
+    if extra:
+        clauses.append(extra)
+    return {"$and": clauses}
 
 
 # -------------------- Helpers --------------------
@@ -44,12 +64,19 @@ def _stable_doc_id(path: str) -> str:
     return _file_sha256(path)
 
 
-def _delete_existing_doc(doc_id: str) -> None:
+def _delete_existing_doc(doc_id: str, conversation_id: int, user_id: int) -> None:
     """
     Remove existing chunks for this doc_id so re-ingesting updates cleanly.
+    Scoped by conversation/user to avoid cross-chat deletions.
     """
     try:
-        existing = _collection.get(where={"doc_id": doc_id})
+        existing = _collection.get(
+            where=_scoped_where(
+                conversation_id,
+                user_id,
+                extra={"doc_id": doc_id},
+            )
+        )
         if existing and existing.get("ids"):
             _collection.delete(ids=existing["ids"])
     except Exception:
@@ -170,7 +197,12 @@ def _chunk_text(text: str, chunk_size: int = 1200, overlap: int = 0) -> List[str
 
 # -------------------- Ingestion --------------------
 
-def ingest_file(path: str) -> str:
+def ingest_file(
+    path: str,
+    conversation_id: int,
+    user_id: int,
+    mime_type: str | None = None,
+) -> str:
     """
     Read a file (PDF/TXT/DOCX), chunk it, embed it, and store in Chroma.
 
@@ -184,11 +216,44 @@ def ingest_file(path: str) -> str:
     filename = os.path.basename(path)
 
     # Remove previously ingested chunks for this doc (so re-upload updates)
-    _delete_existing_doc(doc_id)
+    _delete_existing_doc(doc_id, conversation_id, user_id)
+
+    with _db_session() as db:
+        doc = (
+            db.query(DocumentModel)
+            .filter(
+                DocumentModel.conversation_id == conversation_id,
+                DocumentModel.file_hash == doc_id,
+            )
+            .first()
+        )
+
+        if not doc:
+            doc = DocumentModel(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                filename=filename,
+                mime_type=mime_type,
+                file_hash=doc_id,
+            )
+            db.add(doc)
+            db.commit()
+            db.refresh(doc)
+        else:
+            doc.filename = filename
+            doc.mime_type = mime_type
+            # Keep document row, but refresh chunks on re-upload/update.
+            db.query(DocumentChunk).filter(
+                DocumentChunk.document_id == doc.id
+            ).delete()
+            db.commit()
+
+        document_db_id = doc.id
 
     ids: List[str] = []
     docs: List[str] = []
     metas: List[Dict] = []
+    chunk_rows: List[DocumentChunk] = []
 
     current_section = "other"
 
@@ -217,16 +282,35 @@ def ingest_file(path: str) -> str:
             preview = chunk.strip().replace("\n", " ")
             preview = preview[:200] + ("..." if len(preview) > 200 else "")
 
-            metas.append(
-                {
-                    "doc_id": doc_id,
-                    "filename": filename,
-                    "page": page_idx,          # pdf: real page; txt/docx: 1
-                    "chunk_index": i,
-                    "section": current_section,
-                    "char_len": len(chunk),
-                    "preview": preview,
-                }
+            chunk_meta = {
+                "doc_id": doc_id,
+                "filename": filename,
+                "page": page_idx,          # pdf: real page; txt/docx: 1
+                "chunk_index": i,
+                "section": current_section,
+                "char_len": len(chunk),
+                "preview": preview,
+                "conversation_id": conversation_id,
+                "user_id": user_id,
+                "document_id": document_db_id,
+                "chunk_id": chunk_id,
+            }
+
+            metas.append(chunk_meta)
+
+            chunk_rows.append(
+                DocumentChunk(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    document_id=document_db_id,
+                    chunk_id=chunk_id,
+                    chunk_text=chunk,
+                    page=page_idx,
+                    chunk_index=i,
+                    section=current_section,
+                    preview=preview,
+                    char_len=len(chunk),
+                )
             )
 
     # No text? Still return doc_id so caller knows we handled it.
@@ -242,12 +326,19 @@ def ingest_file(path: str) -> str:
         metadatas=metas,
     )
 
+    with _db_session() as db:
+        # Fast insert of chunk metadata so UI/debug tooling can use it later.
+        db.add_all(chunk_rows)
+        db.commit()
+
     return doc_id
 
 # -------------------- Retrieval (RAG) --------------------
 
 def retrieve_context_and_sources(
     query: str,
+    user_id: int,
+    conversation_id: int,
     k: int = 8,
     top_pages: int = 2,
 ) -> Tuple[str, List[Dict]]:
@@ -259,10 +350,12 @@ def retrieve_context_and_sources(
     """
     q_vec = _embed_query(query)
 
+    # ---- Retrieval scoping ----
     res = _collection.query(
         query_embeddings=[q_vec],
         n_results=k,
         include=["documents", "metadatas", "distances"],
+        where=_scoped_where(conversation_id, user_id),
     )
 
     rows = _extract_query_rows(res)
@@ -296,6 +389,8 @@ def retrieve_context_and_sources(
 
 def retrieve_hits(
     query: str,
+    user_id: int,
+    conversation_id: int,
     k: int = 30,
     intent: str = "general",
     hard_sections: list[str] | None = None,
@@ -304,15 +399,16 @@ def retrieve_hits(
     q_vec = _embed_query(query)
 
     # --- OPTIONAL HARD FILTER BY SECTION ---
-    where = None
+    extra = None
     if hard_sections:
-        where = {"section": {"$in": hard_sections}}
+        extra = {"section": {"$in": hard_sections}}
 
+    # ---- Retrieval scoping ----
     res = _collection.query(
         query_embeddings=[q_vec],
         n_results=k,
         include=["documents", "metadatas", "distances"],
-        where=where,
+        where=_scoped_where(conversation_id, user_id, extra=extra),
     )
 
     rows = _extract_query_rows(res)

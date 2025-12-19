@@ -22,9 +22,9 @@ PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
-from backend.app.db import SessionLocal, engine
-from backend.app.db_init import init_db         
-from backend.app.models import Conversation, Message, RoutingDecision  
+from backend.app.db import SessionLocal
+from backend.app.db_init import init_db, get_default_user_id
+from backend.app.models import Conversation, Message, RoutingDecision, Document  
 from backend.app.rerank import rerank
 from backend.app.retrieval_policy import (
     classify_intent,
@@ -33,6 +33,7 @@ from backend.app.retrieval_policy import (
 )
 from backend.app.vectorstore import ingest_file, retrieve_hits, build_context_and_sources
 from backend.app.verification import verify_answer
+import hashlib
 
 
 
@@ -41,8 +42,11 @@ from backend.app.verification import verify_answer
 # ------------------------------------------------------------------------------
 
 if "db_initialized" not in st.session_state:
-    init_db()
+    default_user_id = init_db()
+    st.session_state["user_id"] = default_user_id
     st.session_state["db_initialized"] = True
+elif "user_id" not in st.session_state:
+    st.session_state["user_id"] = get_default_user_id()
 
 # ------------------------------------------------------------------------------
 # OPENAI CLIENT
@@ -69,10 +73,11 @@ def db_session():
         db.close()
 
 
-def create_conversation() -> int:
+def create_conversation(user_id: int) -> int:
     """Create a new conversation row and return its id."""
     with db_session() as db:
         conv = Conversation(
+            user_id=user_id,
             title=f"Session {datetime.now(timezone.utc).isoformat(timespec='minutes')}"
         )
         db.add(conv)
@@ -81,21 +86,25 @@ def create_conversation() -> int:
         return conv.id
 
 
-def list_conversations(limit: int = 20):
+def list_conversations(user_id: int, limit: int = 20):
     with db_session() as db:
         return (
             db.query(Conversation)
+            .filter(Conversation.user_id == user_id)
             .order_by(Conversation.created_at.desc())
             .limit(limit)
             .all()
         )
 
 
-def load_conversation_messages(conversation_id: int):
+def load_conversation_messages(conversation_id: int, user_id: int):
     with db_session() as db:
         conv = (
             db.query(Conversation)
-            .filter(Conversation.id == conversation_id)
+            .filter(
+                Conversation.id == conversation_id,
+                Conversation.user_id == user_id,
+            )
             .first()
         )
         if not conv:
@@ -138,7 +147,10 @@ def update_conversation_title(conversation_id: int, new_title: str):
     with db_session() as db:
         conv = (
             db.query(Conversation)
-            .filter(Conversation.id == conversation_id)
+            .filter(
+                Conversation.id == conversation_id,
+                Conversation.user_id == st.session_state["user_id"],
+            )
             .first()
         )
         if conv:
@@ -165,6 +177,19 @@ def build_retrieved_excerpts(hits: list[dict]) -> list[dict]:
             }
         )
     return excerpts
+
+
+def list_documents(conversation_id: int, user_id: int) -> list[Document]:
+    with db_session() as db:
+        return (
+            db.query(Document)
+            .filter(
+                Document.conversation_id == conversation_id,
+                Document.user_id == user_id,
+            )
+            .order_by(Document.created_at.desc())
+            .all()
+        )
 
 
 # ------------------------------------------------------------------------------
@@ -216,29 +241,16 @@ uploaded_files = st.sidebar.file_uploader(
     type=["pdf", "txt", "docx"],
     accept_multiple_files=True,
 )
-
-if uploaded_files:
-    raw_dir = os.path.join(PROJECT_ROOT, "data", "raw")
-    os.makedirs(raw_dir, exist_ok=True)
-
-    for f in uploaded_files:
-        save_path = os.path.join(raw_dir, f.name)
-        with open(save_path, "wb") as out:
-            out.write(f.read())
-
-        # Ingest into Chroma
-        doc_id = ingest_file(save_path)
-        st.sidebar.success(f"Ingested {f.name} (doc_id={doc_id[:8]}...)")
-
+user_id = st.session_state["user_id"]
 
 st.sidebar.header("Conversations")
 
-convs = list_conversations()
+convs = list_conversations(user_id=user_id)
 
 # If no conversations exist yet, create one
 if not convs:
-    first_id = create_conversation()
-    convs = list_conversations()  # reload with the new one
+    first_id = create_conversation(user_id=user_id)
+    convs = list_conversations(user_id=user_id)  # reload with the new one
 
 # Make sure session_state has a conversation_id that exists
 if "conversation_id" not in st.session_state:
@@ -250,7 +262,7 @@ else:
 
 # New chat button: create a convo and switch to it
 if st.sidebar.button("➕ New chat"):
-    new_id = create_conversation()
+    new_id = create_conversation(user_id=user_id)
     st.session_state.conversation_id = new_id
     st.rerun()
 
@@ -287,12 +299,58 @@ if st.sidebar.button("Save title"):
     update_conversation_title(selected_conv.id, cleaned_title)
     st.rerun()
 
+# ---- Documents for current conversation ----
+conversation_id = st.session_state.conversation_id
+documents = list_documents(conversation_id, user_id)
+
+# ---- Upload validation ----
+if uploaded_files:
+    raw_dir = os.path.join(PROJECT_ROOT, "data", "raw")
+    os.makedirs(raw_dir, exist_ok=True)
+
+    current_count = len(documents)
+    existing_hashes = {d.file_hash for d in documents}
+
+    for f in uploaded_files:
+        data = f.read()
+        file_hash = hashlib.sha256(data).hexdigest()
+        is_new_doc = file_hash not in existing_hashes
+
+        # Enforce max 5 docs per conversation in app code to keep UX clear and avoid hard DB failures.
+        if is_new_doc and current_count >= 5:
+            st.sidebar.warning("Maximum of 5 documents per conversation. Remove one before uploading more.")
+            continue
+
+        save_path = os.path.join(raw_dir, f.name)
+        with open(save_path, "wb") as out:
+            out.write(data)
+
+        doc_id = ingest_file(
+            save_path,
+            conversation_id=conversation_id,
+            user_id=user_id,
+            mime_type=f.type,
+        )
+        st.sidebar.success(f"Ingested {f.name} (doc_id={doc_id[:8]}...)")
+
+        if is_new_doc:
+            current_count += 1
+            existing_hashes.add(file_hash)
+
+    # refresh list for UI
+    documents = list_documents(conversation_id, user_id)
+
+st.sidebar.markdown(f"**Current conversation documents ({len(documents)}/5)**")
+if documents:
+    for doc in documents:
+        st.sidebar.write(f"• {doc.filename}")
+else:
+    st.sidebar.caption("No documents yet for this chat.")
+
 
 # ------------------- Main chat area ----------------------
 
-conversation_id = st.session_state.conversation_id
-
-history = load_conversation_messages(conversation_id)
+history = load_conversation_messages(conversation_id, user_id)
 
 for msg in history:
     with st.chat_message(msg.role):
@@ -327,7 +385,7 @@ if prompt:
 
     # Build history for LLM (trim to last N turns)
     MAX_TURNS = 8
-    full_history = load_conversation_messages(conversation_id)
+    full_history = load_conversation_messages(conversation_id, user_id)
     trimmed = full_history[-MAX_TURNS:]
 
     chat_history = [
@@ -388,6 +446,8 @@ if prompt:
                 # Retrieve more candidates (policy-aware)
                 hits = retrieve_hits(
                     prompt,
+                    user_id=user_id,
+                    conversation_id=conversation_id,
                     k=30,
                     intent=intent,
                     hard_sections=hard_sections,
