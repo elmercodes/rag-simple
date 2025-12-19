@@ -1,25 +1,19 @@
-# backend/app/vectorstore.py
 import os
 import uuid
-from collections import defaultdict
 import re
+import hashlib
+from collections import defaultdict
+from typing import Tuple, List, Dict
 
 import chromadb
 from pypdf import PdfReader
-import hashlib
-from typing import Optional, Tuple, List, Dict
-
-from pypdf import PdfReader
 from docx import Document
-
 
 from .embeddings import embed_texts
 from .sectioning import detect_section_from_page_text
 
 
-# --------------------------------------------------------------------
-# PATHS & CLIENT
-# --------------------------------------------------------------------
+# -------------------- Paths & Client --------------------
 
 # project root: backend/app -> backend -> project
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
@@ -31,9 +25,9 @@ os.makedirs(VECTOR_DIR, exist_ok=True)
 _client = chromadb.PersistentClient(path=VECTOR_DIR)
 _collection = _client.get_or_create_collection("docs")
 
-# --------------------------------------------------------------------
-# HELPER FUNCTIONS
-# --------------------------------------------------------------------
+
+# -------------------- Helpers --------------------
+
 def _file_sha256(path: str, block_size: int = 1024 * 1024) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -41,12 +35,14 @@ def _file_sha256(path: str, block_size: int = 1024 * 1024) -> str:
             h.update(chunk)
     return h.hexdigest()
 
+
 def _stable_doc_id(path: str) -> str:
     """
     Stable doc_id so re-uploading same exact file doesn't create duplicates.
     Uses SHA256(file bytes). Not a UUID.
     """
     return _file_sha256(path)
+
 
 def _delete_existing_doc(doc_id: str) -> None:
     """
@@ -61,6 +57,37 @@ def _delete_existing_doc(doc_id: str) -> None:
         # we can swap to a query-based delete later. For now, fail-soft.
         pass
 
+
+def _page_key(doc_id: str, filename: str, page: int) -> Tuple[str, str, int]:
+    """Consistent page key used for aggregation/deduping."""
+    return (doc_id, filename, page)
+
+
+def _embed_query(query: str) -> List[float]:
+    """Single-text embedding wrapper to avoid repeated list indexing."""
+    return embed_texts([query])[0]
+
+
+def _similarity_from_distance(distance: float) -> float:
+    return 1 / (1 + distance)
+
+
+def _extract_query_rows(res) -> List[Tuple[str, Dict, float]]:
+    """
+    Normalize Chroma query response into a list of (doc, meta, distance) tuples.
+    Keeps ordering identical to the underlying response.
+    """
+    if not res["documents"] or not res["documents"][0]:
+        return []
+
+    docs = res["documents"][0]
+    metas = res["metadatas"][0]
+    dists = res["distances"][0]
+    return list(zip(docs, metas, dists))
+
+
+# -------------------- File Reading --------------------
+
 def _read_pdf_pages(path: str) -> List[Tuple[int, str]]:
     reader = PdfReader(path)
     pages = []
@@ -68,11 +95,13 @@ def _read_pdf_pages(path: str) -> List[Tuple[int, str]]:
         pages.append((page_idx, page.extract_text() or ""))
     return pages
 
+
 def _read_txt_pages(path: str) -> List[Tuple[int, str]]:
     # Treat as single "page" for now
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         text = f.read()
     return [(1, text)]
+
 
 def _read_docx_pages(path: str) -> List[Tuple[int, str]]:
     # DOCX doesn't have true pages easily without layout engine.
@@ -81,6 +110,7 @@ def _read_docx_pages(path: str) -> List[Tuple[int, str]]:
     paras = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
     text = "\n".join(paras)
     return [(1, text)]
+
 
 def _read_any_file(path: str) -> List[Tuple[int, str]]:
     ext = os.path.splitext(path)[1].lower()
@@ -93,11 +123,7 @@ def _read_any_file(path: str) -> List[Tuple[int, str]]:
     raise ValueError(f"Unsupported file type: {ext}")
 
 
-
-
-# --------------------------------------------------------------------
-# CHUNKING
-# --------------------------------------------------------------------
+# -------------------- Chunking --------------------
 
 def _chunk_text(text: str, chunk_size: int = 1200, overlap: int = 0) -> List[str]:
     """
@@ -142,11 +168,7 @@ def _chunk_text(text: str, chunk_size: int = 1200, overlap: int = 0) -> List[str
 
     return chunks
 
-
-
-# --------------------------------------------------------------------
-# INGESTION
-# --------------------------------------------------------------------
+# -------------------- Ingestion --------------------
 
 def ingest_file(path: str) -> str:
     """
@@ -222,11 +244,7 @@ def ingest_file(path: str) -> str:
 
     return doc_id
 
-
-
-# --------------------------------------------------------------------
-# RETRIEVAL (RAG)
-# --------------------------------------------------------------------
+# -------------------- Retrieval (RAG) --------------------
 
 def retrieve_context_and_sources(
     query: str,
@@ -239,7 +257,7 @@ def retrieve_context_and_sources(
     - context: concatenated top-k chunk texts
     - sources: list of top 'page' hits with filename + page number
     """
-    q_vec = embed_texts([query])[0]
+    q_vec = _embed_query(query)
 
     res = _collection.query(
         query_embeddings=[q_vec],
@@ -247,20 +265,16 @@ def retrieve_context_and_sources(
         include=["documents", "metadatas", "distances"],
     )
 
-    if not res["documents"] or not res["documents"][0]:
+    rows = _extract_query_rows(res)
+    if not rows:
         return "", []
 
-    docs = res["documents"][0]
-    metas = res["metadatas"][0]
-    dists = res["distances"][0]
-
-    # Convert distances (smaller = better) to scores
-    scores = [1 / (1 + d) for d in dists]
+    scores = [_similarity_from_distance(dist) for _, _, dist in rows]
 
     # Aggregate scores by (doc_id, filename, page)
     page_scores = defaultdict(float)
-    for meta, score in zip(metas, scores):
-        key = (meta["doc_id"], meta["filename"], meta["page"])
+    for (_, meta, _), score in zip(rows, scores):
+        key = _page_key(meta["doc_id"], meta["filename"], meta["page"])
         page_scores[key] += score
 
     best_pages = sorted(
@@ -270,12 +284,12 @@ def retrieve_context_and_sources(
     )[:top_pages]
 
     sources = [
-        {"doc_id": k[0][0], "filename": k[0][1], "page": k[0][2]}
-        for k in best_pages
+        {"doc_id": doc_id, "filename": filename, "page": page}
+        for (doc_id, filename, page), _ in best_pages
     ]
 
     # Build context as concatenation of retrieved chunks
-    context = "\n\n---\n\n".join(docs)
+    context = "\n\n---\n\n".join(doc for doc, _, _ in rows)
 
     return context, sources
 
@@ -287,7 +301,7 @@ def retrieve_hits(
     hard_sections: list[str] | None = None,
     preferred: list[str] | None = None,
 ) -> List[Dict]:
-    q_vec = embed_texts([query])[0]
+    q_vec = _embed_query(query)
 
     # --- OPTIONAL HARD FILTER BY SECTION ---
     where = None
@@ -301,20 +315,17 @@ def retrieve_hits(
         where=where,
     )
 
-    if not res["documents"] or not res["documents"][0]:
+    rows = _extract_query_rows(res)
+    if not rows:
         return []
-
-    docs = res["documents"][0]
-    metas = res["metadatas"][0]
-    dists = res["distances"][0]
 
     hits: List[Dict] = []
 
-    for doc, meta, dist in zip(docs, metas, dists):
+    for doc, meta, dist in rows:
         section = meta.get("section", "other")
 
         # --- base similarity score ---
-        score = 1 / (1 + dist)
+        score = _similarity_from_distance(dist)
 
         # --- discount impact sections unless intent is impact ---
         if intent != "impact" and section == "impact":
@@ -380,7 +391,7 @@ def build_context_and_sources(
     page_to_hits = defaultdict(list)
 
     for h in hits:
-        key = (h["doc_id"], h["filename"], h["page"])
+        key = _page_key(h["doc_id"], h["filename"], h["page"])
         page_scores[key] += score_fn(h)
         page_to_hits[key].append(h)
 
@@ -406,8 +417,8 @@ def build_context_and_sources(
 
     # 3) Build sources list
     sources = [
-        {"doc_id": k[0], "filename": k[1], "page": k[2]}
-        for k in selected_page_keys
+        {"doc_id": doc_id, "filename": filename, "page": page}
+        for (doc_id, filename, page) in selected_page_keys
     ]
 
     # 4) Collect best chunks from selected pages

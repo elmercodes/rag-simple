@@ -1,5 +1,5 @@
 # backend/app/models.py
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Float
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from .db import Base
@@ -43,3 +43,22 @@ class Message(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     conversation = relationship("Conversation", back_populates="messages")
+    routing_decision = relationship(
+        "RoutingDecision",
+        back_populates="message",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
+
+
+class RoutingDecision(Base):
+    __tablename__ = "routing_decisions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    message_id = Column(Integer, ForeignKey("messages.id"), nullable=False, unique=True)
+    answer_mode = Column(String(20), nullable=False)  # "rag" | "direct"
+    reason = Column(Text, nullable=True)
+    confidence = Column(Float, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    message = relationship("Message", back_populates="routing_decision")
