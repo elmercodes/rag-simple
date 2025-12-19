@@ -366,9 +366,9 @@ for msg in history:
                         location = ex["doc_name"]
                         if ex.get("page"):
                             location += f" — page {ex['page']}"
-                    prefix = f"{ex.get('rank', 0)}."
+                    prefix = f"{ex.get('rank', 0)})"
                     if location:
-                        prefix = f"{ex.get('rank', 0)}. {location}"
+                        prefix = f"{ex.get('rank', 0)}) {location}"
                     st.markdown(f"{prefix}\n\n> {ex.get('text', '')}")
 
 
@@ -491,14 +491,23 @@ if prompt:
                     evidence_hits=evidence_hits,
                     refusal_text="I can’t find a supported answer in the provided document excerpts.",
                 )
+                verdict = (vdebug or {}).get("verdict", "UNSUPPORTED")
+                confidence = (vdebug or {}).get("confidence", 0.0)
+                # Only surface excerpts when the verifier considers the answer supported enough.
+                show_evidence = verdict in ("SUPPORTED", "PARTIAL") and bool(evidence_hits)
 
                 placeholder.markdown(final_answer)
 
-                retrieved_excerpts = build_retrieved_excerpts(hits)
+                # Hide evidence when the verifier marks the answer unsupported so we don't surface ungrounded context.
+                retrieved_excerpts = build_retrieved_excerpts(hits) if show_evidence else []
                 meta_data["retrieved_excerpts"] = retrieved_excerpts
+                meta_data["verification"] = {
+                    "verdict": verdict,
+                    "confidence": confidence,
+                }
 
                 # --- Supporting excerpts (user-facing) ---
-                if retrieved_excerpts:
+                if show_evidence and retrieved_excerpts:
                     st.markdown("### Relevant excerpts")
                     for ex in retrieved_excerpts:
                         location = ""
@@ -506,9 +515,9 @@ if prompt:
                             location = f"{ex['doc_name']}"
                             if ex.get("page"):
                                 location += f" — page {ex['page']}"
-                        prefix = f"{ex.get('rank', 0)}."
+                        prefix = f"{ex.get('rank', 0)})"
                         if location:
-                            prefix = f"{ex.get('rank', 0)}. {location}"
+                            prefix = f"{ex.get('rank', 0)}) {location}"
                         st.markdown(
                             f"{prefix}\n\n> {ex.get('text', '')}"
                         )
