@@ -29,9 +29,6 @@ def verify_answer(
         "You are a judge evaluating whether an answer is supported by the provided document excerpts.\n"
         "Be strict enough to avoid hallucinations, but NOT overly strict.\n"
         "The assistant is allowed to use common sense and make reasonable assumptions ONLY if they are consistent with the excerpts.\n\n"
-        "FINAL must be user-facing natural language. Never mention the existence of drafts, excerpts, judges, verification, or evaluation.\n"
-        "Do not include any meta commentary.\n"
-        "If VERDICT is UNSUPPORTED, FINAL must equal the refusal text exactly and nothing else.\n\n"
         "Your job:\n"
         "1) Decide if the DRAFT answers the QUESTION.\n"
         "2) Decide if the DRAFT is supported by the EXCERPTS.\n\n"
@@ -83,10 +80,8 @@ def verify_answer(
         final = m_f.group(1).strip()
 
     # Safety fallbacks:
-    if verdict == "UNSUPPORTED":
-        final = refusal_text
-    elif not final:
-        final = draft or ""
+    if not final:
+        final = refusal_text if verdict == "UNSUPPORTED" else (draft or "")
 
     # IMPORTANT: if verdict is PARTIAL, never hard-refuse.
     # Keep a hedged answer instead.
