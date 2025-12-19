@@ -358,8 +358,11 @@ for msg in history:
         if msg.role == "assistant":
             meta = msg.meta or {}
             excerpts = meta.get("retrieved_excerpts") or []
-            if meta.get("used_docs") and excerpts:
-                st.markdown("### Relevant excerpts")
+            verdict = (meta.get("verification") or {}).get("verdict")
+            # Suppress evidence when the verifier marked the answer unsupported.
+            show_evidence = meta.get("used_docs") and excerpts and verdict != "UNSUPPORTED"
+            if show_evidence:
+                st.markdown("### Context")
                 for ex in excerpts:
                     location = ""
                     if ex.get("doc_name"):
@@ -458,7 +461,7 @@ if prompt:
                 hits = rerank(prompt, hits, top_n=18)
 
                 # Build context + top page sources +
-                context, _sources, evidence_hits = build_context_and_sources(hits, top_pages=2)
+                context, _sources, evidence_hits = build_context_and_sources(hits, top_pages=3)
 
                 # ---------------- PASS 1: Generate best-effort paragraph from evidence ----------------
                 answer_system = (
@@ -499,7 +502,7 @@ if prompt:
                 placeholder.markdown(final_answer)
 
                 # Hide evidence when the verifier marks the answer unsupported so we don't surface ungrounded context.
-                retrieved_excerpts = build_retrieved_excerpts(hits) if show_evidence else []
+                retrieved_excerpts = build_retrieved_excerpts(evidence_hits) if show_evidence else []
                 meta_data["retrieved_excerpts"] = retrieved_excerpts
                 meta_data["verification"] = {
                     "verdict": verdict,
@@ -508,7 +511,7 @@ if prompt:
 
                 # --- Supporting excerpts (user-facing) ---
                 if show_evidence and retrieved_excerpts:
-                    st.markdown("### Relevant excerpts")
+                    st.markdown("### Context")
                     for ex in retrieved_excerpts:
                         location = ""
                         if ex.get("doc_name"):
