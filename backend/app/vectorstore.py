@@ -6,10 +6,16 @@ from collections import defaultdict
 from typing import Tuple, List, Dict
 
 import chromadb
+from openai import OpenAI
 from pypdf import PdfReader
 from docx import Document
 
-from .embeddings import embed_texts
+from .embeddings import (
+    embed_texts,
+    embed_query,
+    embedding_model_name,
+    embedding_dimension,
+)
 from .sectioning import detect_section_from_page_text
 from .db import SessionLocal
 from .models import Document as DocumentModel, DocumentChunk
@@ -23,13 +29,93 @@ VECTOR_DIR = os.path.join(BASE_DIR, "data", "vector_store")
 
 os.makedirs(VECTOR_DIR, exist_ok=True)
 
-# For now, keep it simple: one persistent Chroma client + collection
+# For now, keep it simple: one persistent Chroma client + named collections
 _client = chromadb.PersistentClient(path=VECTOR_DIR)
-_collection = _client.get_or_create_collection("docs")
+_collections: Dict[str, chromadb.api.models.Collection.Collection] = {}
+
+# Legacy (OpenAI) + new BGE collection names
+LEGACY_COLLECTION_NAME = "docs"  # existing collection with OpenAI embeddings
+ACTIVE_COLLECTION_NAME = "chroma_bge_large_en_v1_5"
+
+LEGACY_EMBEDDING_MODEL = "text-embedding-3-small"
+LEGACY_EMBEDDING_DIM = 1536
+
+
+def _get_collection(name: str):
+    if name not in _collections:
+        _collections[name] = _client.get_or_create_collection(name)
+    return _collections[name]
 
 
 def _db_session():
     return SessionLocal()
+
+
+def _get_secret(key: str):
+    env_val = os.getenv(key)
+    if env_val:
+        return env_val
+    try:
+        import streamlit as st  # lazy import to avoid hard dependency
+        return st.secrets.get(key)
+    except Exception:
+        return None
+
+
+def _active_embedding_config() -> Dict:
+    return {
+        "embedding_model": embedding_model_name(),
+        "embedding_dim": embedding_dimension(),
+        "vectorstore_collection": ACTIVE_COLLECTION_NAME,
+    }
+
+
+def _legacy_embedding_config() -> Dict:
+    return {
+        "embedding_model": LEGACY_EMBEDDING_MODEL,
+        "embedding_dim": LEGACY_EMBEDDING_DIM,
+        "vectorstore_collection": LEGACY_COLLECTION_NAME,
+    }
+
+
+def _conversation_embedding_config(conversation_id: int) -> Dict:
+    """
+    Determine which collection/embedding settings to use for a conversation.
+    Falls back to legacy if documents exist without metadata.
+    """
+    with _db_session() as db:
+        doc = (
+            db.query(DocumentModel)
+            .filter(DocumentModel.conversation_id == conversation_id)
+            .order_by(DocumentModel.created_at.desc())
+            .first()
+        )
+        if doc:
+            if doc.vectorstore_collection:
+                return {
+                    "embedding_model": doc.embedding_model
+                    or (
+                        LEGACY_EMBEDDING_MODEL
+                        if doc.vectorstore_collection == LEGACY_COLLECTION_NAME
+                        else embedding_model_name()
+                    ),
+                    "embedding_dim": doc.embedding_dim
+                    or (
+                        LEGACY_EMBEDDING_DIM
+                        if doc.vectorstore_collection == LEGACY_COLLECTION_NAME
+                        else embedding_dimension()
+                    ),
+                    "vectorstore_collection": doc.vectorstore_collection,
+                }
+            # Documents with no recorded collection are assumed to be legacy.
+            return _legacy_embedding_config()
+
+    # No documents for this conversation yet: default to active BGE collection.
+    return _active_embedding_config()
+
+
+def _collection_for_config(cfg: Dict):
+    return _get_collection(cfg["vectorstore_collection"])
 
 
 def _scoped_where(conversation_id: int, user_id: int, extra: Dict | None = None) -> Dict:
@@ -64,13 +150,18 @@ def _stable_doc_id(path: str) -> str:
     return _file_sha256(path)
 
 
-def _delete_existing_doc(doc_id: str, conversation_id: int, user_id: int) -> None:
+def _delete_existing_doc(
+    doc_id: str,
+    conversation_id: int,
+    user_id: int,
+    collection,
+) -> None:
     """
     Remove existing chunks for this doc_id so re-ingesting updates cleanly.
     Scoped by conversation/user to avoid cross-chat deletions.
     """
     try:
-        existing = _collection.get(
+        existing = collection.get(
             where=_scoped_where(
                 conversation_id,
                 user_id,
@@ -78,7 +169,7 @@ def _delete_existing_doc(doc_id: str, conversation_id: int, user_id: int) -> Non
             )
         )
         if existing and existing.get("ids"):
-            _collection.delete(ids=existing["ids"])
+            collection.delete(ids=existing["ids"])
     except Exception:
         # If collection.get(where=...) isn't supported by your Chroma version,
         # we can swap to a query-based delete later. For now, fail-soft.
@@ -90,9 +181,27 @@ def _page_key(doc_id: str, filename: str, page: int) -> Tuple[str, str, int]:
     return (doc_id, filename, page)
 
 
-def _embed_query(query: str) -> List[float]:
-    """Single-text embedding wrapper to avoid repeated list indexing."""
-    return embed_texts([query])[0]
+def _legacy_embed_query(query: str) -> List[float]:
+    """
+    Compatibility path for legacy OpenAI embeddings.
+    """
+    api_key = _get_secret("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY required for legacy embedding lookups.")
+    client = OpenAI(api_key=api_key)
+    resp = client.embeddings.create(
+        model=LEGACY_EMBEDDING_MODEL,
+        input=[query],
+    )
+    return resp.data[0].embedding
+
+
+def _embed_query(query: str, cfg: Dict) -> List[float]:
+    """Embed a single query using the embedding model tied to the collection."""
+    collection_name = cfg.get("vectorstore_collection")
+    if collection_name == LEGACY_COLLECTION_NAME:
+        return _legacy_embed_query(query)
+    return embed_query(query)
 
 
 def _similarity_from_distance(distance: float) -> float:
@@ -214,9 +323,11 @@ def ingest_file(
     """
     doc_id = _stable_doc_id(path)
     filename = os.path.basename(path)
+    embedding_cfg = _active_embedding_config()
+    collection = _collection_for_config(embedding_cfg)
 
     # Remove previously ingested chunks for this doc (so re-upload updates)
-    _delete_existing_doc(doc_id, conversation_id, user_id)
+    _delete_existing_doc(doc_id, conversation_id, user_id, collection)
 
     with _db_session() as db:
         doc = (
@@ -235,6 +346,9 @@ def ingest_file(
                 filename=filename,
                 mime_type=mime_type,
                 file_hash=doc_id,
+                embedding_model=embedding_cfg["embedding_model"],
+                embedding_dim=embedding_cfg["embedding_dim"],
+                vectorstore_collection=embedding_cfg["vectorstore_collection"],
             )
             db.add(doc)
             db.commit()
@@ -242,6 +356,9 @@ def ingest_file(
         else:
             doc.filename = filename
             doc.mime_type = mime_type
+            doc.embedding_model = embedding_cfg["embedding_model"]
+            doc.embedding_dim = embedding_cfg["embedding_dim"]
+            doc.vectorstore_collection = embedding_cfg["vectorstore_collection"]
             # Keep document row, but refresh chunks on re-upload/update.
             db.query(DocumentChunk).filter(
                 DocumentChunk.document_id == doc.id
@@ -294,6 +411,9 @@ def ingest_file(
                 "user_id": user_id,
                 "document_id": document_db_id,
                 "chunk_id": chunk_id,
+                "embedding_model": embedding_cfg["embedding_model"],
+                "embedding_dim": embedding_cfg["embedding_dim"],
+                "vectorstore_collection": embedding_cfg["vectorstore_collection"],
             }
 
             metas.append(chunk_meta)
@@ -310,6 +430,9 @@ def ingest_file(
                     section=current_section,
                     preview=preview,
                     char_len=len(chunk),
+                    embedding_model=embedding_cfg["embedding_model"],
+                    embedding_dim=embedding_cfg["embedding_dim"],
+                    vectorstore_collection=embedding_cfg["vectorstore_collection"],
                 )
             )
 
@@ -319,7 +442,7 @@ def ingest_file(
 
     vectors = embed_texts(docs)
 
-    _collection.add(
+    collection.add(
         ids=ids,
         documents=docs,
         embeddings=vectors,
@@ -348,10 +471,12 @@ def retrieve_context_and_sources(
     - context: concatenated top-k chunk texts
     - sources: list of top 'page' hits with filename + page number
     """
-    q_vec = _embed_query(query)
+    embedding_cfg = _conversation_embedding_config(conversation_id)
+    collection = _collection_for_config(embedding_cfg)
+    q_vec = _embed_query(query, embedding_cfg)
 
     # ---- Retrieval scoping ----
-    res = _collection.query(
+    res = collection.query(
         query_embeddings=[q_vec],
         n_results=k,
         include=["documents", "metadatas", "distances"],
@@ -396,7 +521,9 @@ def retrieve_hits(
     hard_sections: list[str] | None = None,
     preferred: list[str] | None = None,
 ) -> List[Dict]:
-    q_vec = _embed_query(query)
+    embedding_cfg = _conversation_embedding_config(conversation_id)
+    collection = _collection_for_config(embedding_cfg)
+    q_vec = _embed_query(query, embedding_cfg)
 
     # --- OPTIONAL HARD FILTER BY SECTION ---
     extra = None
@@ -404,7 +531,7 @@ def retrieve_hits(
         extra = {"section": {"$in": hard_sections}}
 
     # ---- Retrieval scoping ----
-    res = _collection.query(
+    res = collection.query(
         query_embeddings=[q_vec],
         n_results=k,
         include=["documents", "metadatas", "distances"],

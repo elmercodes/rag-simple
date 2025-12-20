@@ -1,25 +1,51 @@
 from typing import List
-from openai import OpenAI
-import os
+
 import streamlit as st
+from sentence_transformers import SentenceTransformer
 
 
-##############################################################################
-# Update later for open source models
-##############################################################################
-@st.cache_resource
-def get_openai_client():
-    return OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+EMBEDDING_MODEL = "BAAI/bge-large-en-v1.5"
+EMBEDDING_DIMENSION = 1024
 
-_client = get_openai_client()
 
-EMBEDDING_MODEL = "text-embedding-3-small"
+@st.cache_resource(show_spinner=False)
+def _load_model() -> SentenceTransformer:
+    # Cache the model across Streamlit reruns so we don't reload on each request.
+    return SentenceTransformer(EMBEDDING_MODEL)
 
 
 def embed_texts(texts: List[str]) -> List[List[float]]:
-    # OpenAI expects a list of inputs
-    resp = _client.embeddings.create(
-        model=EMBEDDING_MODEL,
-        input=texts,
+    """
+    Embed passages using BGE with the recommended prefix + normalization.
+    """
+    if not texts:
+        return []
+    model = _load_model()
+    prefixed = [f"passage: {t}" for t in texts]
+    vectors = model.encode(
+        prefixed,
+        normalize_embeddings=True,
+        convert_to_numpy=True,
     )
-    return [d.embedding for d in resp.data]
+    return vectors.tolist()
+
+
+def embed_query(query: str) -> List[float]:
+    """
+    Embed a single query string with the BGE query instruction prefix.
+    """
+    model = _load_model()
+    vector = model.encode(
+        [f"query: {query}"],
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+    )[0]
+    return vector.tolist()
+
+
+def embedding_model_name() -> str:
+    return EMBEDDING_MODEL
+
+
+def embedding_dimension() -> int:
+    return EMBEDDING_DIMENSION

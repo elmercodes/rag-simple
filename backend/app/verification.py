@@ -7,7 +7,7 @@ def _trim(text: str, max_chars: int = 7000) -> str:
 
 def verify_answer(
     *,
-    client,
+    chat_client,
     model: str,
     question: str,
     draft: str,
@@ -52,7 +52,7 @@ def verify_answer(
         f"EXCERPTS:\n{excerpts}\n"
     )
 
-    resp = client.chat.completions.create(
+    resp = chat_client.chat_complete(
         model=model,
         messages=[
             {"role": "system", "content": judge_system},

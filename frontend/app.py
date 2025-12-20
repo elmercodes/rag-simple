@@ -5,7 +5,6 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import streamlit as st
-from openai import OpenAI
 from openai import (
     APIConnectionError,
     APIStatusError,
@@ -33,6 +32,7 @@ from backend.app.retrieval_policy import (
 )
 from backend.app.vectorstore import ingest_file, retrieve_hits, build_context_and_sources
 from backend.app.verification import verify_answer
+from backend.app.llm import get_chat_client
 import hashlib
 
 
@@ -49,13 +49,24 @@ elif "user_id" not in st.session_state:
     st.session_state["user_id"] = get_default_user_id()
 
 # ------------------------------------------------------------------------------
-# OPENAI CLIENT
+# LLM PROVIDERS
 # ------------------------------------------------------------------------------
 
-client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+DEFAULT_CHAT_MODELS = {
+    "openai": st.secrets.get("OPENAI_MODEL", "gpt-5-nano"),
+    "qwen-3": st.secrets.get("QWEN_MODEL_NAME", "qwen-3"),
+}
 
-if "openai_model" not in st.session_state:
-    st.session_state["openai_model"] = "gpt-5-nano"
+if "chat_models" not in st.session_state:
+    st.session_state["chat_models"] = DEFAULT_CHAT_MODELS.copy()
+
+if "llm_provider_by_conversation" not in st.session_state:
+    st.session_state["llm_provider_by_conversation"] = {}
+
+
+@st.cache_resource
+def get_cached_chat_client(provider: str):
+    return get_chat_client(provider)
 
 # Sticky toggle for RAG vs AI-only (defaults to ON to preserve current behavior)
 if "use_documents" not in st.session_state:
@@ -192,16 +203,30 @@ def list_documents(conversation_id: int, user_id: int) -> list[Document]:
         )
 
 
+def current_llm_provider(conversation_id: int) -> str:
+    providers = st.session_state["llm_provider_by_conversation"]
+    if conversation_id not in providers:
+        providers[conversation_id] = "openai"
+    return providers[conversation_id]
+
+
+def model_for_provider(provider: str) -> str:
+    return st.session_state["chat_models"].get(
+        provider,
+        st.session_state["chat_models"].get("openai", DEFAULT_CHAT_MODELS["openai"]),
+    )
+
+
 # ------------------------------------------------------------------------------
 # OPENAI CALL + RETRY
 # ------------------------------------------------------------------------------
 
 
-def call_llm_with_retry(client: OpenAI, messages, max_retries: int = 2):
+def call_llm_with_retry(chat_client, model_name: str, messages, max_retries: int = 2):
     for attempt in range(max_retries):
         try:
-            return client.chat.completions.create(
-                model=st.session_state["openai_model"],
+            return chat_client.chat_complete(
+                model=model_name,
                 messages=messages,
                 stream=True,
             )
@@ -285,6 +310,23 @@ if selected_conv.id != current_id:
 
     st.rerun()
 
+conversation_id = st.session_state.conversation_id
+
+# ---- LLM provider per conversation ----
+provider_options = ["openai", "qwen-3"]
+current_provider = current_llm_provider(conversation_id)
+provider_index = provider_options.index(current_provider) if current_provider in provider_options else 0
+selected_provider = st.sidebar.selectbox(
+    "Language model",
+    options=provider_options,
+    index=provider_index,
+    format_func=lambda v: "OpenAI" if v == "openai" else "qwen-3",
+    key=f"llm_provider_{conversation_id}",
+    help="Choose which chat model to use for this conversation.",
+)
+st.session_state["llm_provider_by_conversation"][conversation_id] = selected_provider
+st.sidebar.caption(f"Model: {model_for_provider(selected_provider)}")
+
 # ---- Rename conversation ----
 st.sidebar.subheader("Rename conversation")
 
@@ -300,7 +342,6 @@ if st.sidebar.button("Save title"):
     st.rerun()
 
 # ---- Documents for current conversation ----
-conversation_id = st.session_state.conversation_id
 documents = list_documents(conversation_id, user_id)
 
 # ---- Upload validation ----
@@ -386,6 +427,9 @@ if prompt:
     with st.chat_message("user"):
         st.markdown(prompt)
 
+    llm_provider = current_llm_provider(conversation_id)
+    chat_model = model_for_provider(llm_provider)
+
     # Build history for LLM (trim to last N turns)
     MAX_TURNS = 8
     full_history = load_conversation_messages(conversation_id, user_id)
@@ -406,10 +450,13 @@ if prompt:
     meta_data = {
         "used_docs": bool(st.session_state["use_documents"]),
         "retrieved_excerpts": [],
+        "llm_provider": llm_provider,
+        "llm_model": chat_model,
     }
     retrieved_excerpts: list[dict] = []
 
     try:
+        chat_client = get_cached_chat_client(llm_provider)
         with st.chat_message("assistant"):
             placeholder = st.empty()
 
@@ -424,7 +471,7 @@ if prompt:
                     {"role": "user", "content": prompt},
                 ]
 
-                stream = call_llm_with_retry(client, direct_messages)
+                stream = call_llm_with_retry(chat_client, chat_model, direct_messages)
                 direct_answer = placeholder.write_stream(stream)
 
                 # Subtle note when AI-only mode is selected by the user.
@@ -481,13 +528,13 @@ if prompt:
                     {"role": "user", "content": prompt},
                 ]
 
-                stream = call_llm_with_retry(client, answer_messages)
+                stream = call_llm_with_retry(chat_client, chat_model, answer_messages)
                 draft = placeholder.write_stream(stream)
 
                 # ---------------- PASS 2: Less-strict check (answered? supported enough?) ----------------
                 final_answer, vdebug = verify_answer(
-                    client=client,
-                    model=st.session_state["openai_model"],
+                    chat_client=chat_client,
+                    model=chat_model,
                     question=prompt,
                     draft=draft,
                     context=context,
@@ -541,13 +588,13 @@ if prompt:
 
 
     except AuthenticationError as e:
-        st.error("OpenAI authentication failed. Check your API key in st.secrets.")
+        st.error("Authentication failed for the selected language model provider. Check your API keys/base URL.")
         st.exception(e)
     except APIConnectionError:
-        st.warning("Lost connection to OpenAI while answering. Please try again.")
+        st.warning("Lost connection to the language model provider while answering. Please try again.")
     except APIStatusError as e:
-        st.error(f"OpenAI API returned an error: {e.status_code}")
+        st.error(f"LLM provider returned an error: {e.status_code}")
         st.exception(e)
     except Exception as e:
-        st.error("Unexpected error talking to OpenAI.")
+        st.error("Unexpected error talking to the LLM provider.")
         st.exception(e)

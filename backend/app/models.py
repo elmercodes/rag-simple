@@ -99,6 +99,9 @@ class Document(Base):
     filename = Column(String(255), nullable=False)
     mime_type = Column(String(255), nullable=True)
     file_hash = Column(String(255), nullable=False)
+    embedding_model = Column(String(255), nullable=True)
+    embedding_dim = Column(Integer, nullable=True)
+    vectorstore_collection = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     user = relationship("User", back_populates="documents")
@@ -130,6 +133,9 @@ class DocumentChunk(Base):
     section = Column(String(255), nullable=True)
     preview = Column(Text, nullable=True)
     char_len = Column(Integer, nullable=True)
+    embedding_model = Column(String(255), nullable=True)
+    embedding_dim = Column(Integer, nullable=True)
+    vectorstore_collection = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     document = relationship("Document", back_populates="chunks")

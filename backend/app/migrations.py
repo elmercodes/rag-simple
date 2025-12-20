@@ -27,6 +27,19 @@ def _ensure_meta_column():
             conn.commit()
 
 
+def _ensure_column(table: str, column: str, type_sql: str) -> None:
+    """
+    Add a column to a table if it does not exist.
+    """
+    inspector = inspect(engine)
+    columns = [c["name"] for c in inspector.get_columns(table)]
+    if column in columns:
+        return
+    with engine.connect() as conn:
+        conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {type_sql}"))
+        conn.commit()
+
+
 def ensure_default_user() -> int:
     """
     Ensure a local fallback user exists for non-auth flows.
@@ -123,6 +136,12 @@ def run_migrations() -> int:
     """
     _ensure_tables_exist()
     _ensure_meta_column()
+    _ensure_column("documents", "embedding_model", "VARCHAR(255)")
+    _ensure_column("documents", "embedding_dim", "INTEGER")
+    _ensure_column("documents", "vectorstore_collection", "VARCHAR(255)")
+    _ensure_column("document_chunks", "embedding_model", "VARCHAR(255)")
+    _ensure_column("document_chunks", "embedding_dim", "INTEGER")
+    _ensure_column("document_chunks", "vectorstore_collection", "VARCHAR(255)")
     default_user_id = ensure_default_user()
     if _conversations_need_rebuild():
         _rebuild_conversations_table(default_user_id)
