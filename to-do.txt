@@ -8,8 +8,6 @@ Things I'd like to do in order to make this a pro-level project
 -5  update the UI so that instead of streamlit I use actual code to make the frontend better for users to use and look at. Also fix 
     the toggle button bug (cant be on without doucuments)
 
--2  make code compatible with open source models.
-
 -6  containerize with docker.
 
 -7  CI/CD with kubernetes.
