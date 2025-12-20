@@ -23,5 +23,13 @@ chat.db
 data/vector_store/
 
 # Folder
-node_modules/
 .env
+
+# Next.js
+apps/frontend/.next/
+apps/frontend/out/
+apps/frontend/.turbo/
+apps/frontend/node_modules/
+
+# Env
+apps/frontend/.env*.local
