@@ -23,5 +23,4 @@ chat.db
 data/vector_store/
 
 # Folder
-.streamlit/
-frontend/play.py
+node_modules/
