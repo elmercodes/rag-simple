@@ -60,7 +60,7 @@ export default function AttachmentViewer({
 
     let isActive = true;
     setIsLoadingText(true);
-    getText(`/attachments/${attachment.id}/content`)
+    getText(attachmentContentUrl(attachment.id))
       .then((text) => {
         if (isActive) {
           setTextContent(text);
@@ -80,7 +80,7 @@ export default function AttachmentViewer({
     return () => {
       isActive = false;
     };
-  }, [attachment.type, attachment.url, isTxt]);
+  }, [attachment.id, attachment.type, isTxt]);
 
   React.useEffect(() => {
     if (!isDocx) {
@@ -101,7 +101,7 @@ export default function AttachmentViewer({
     setIsLoadingDocx(true);
     setDocxError(false);
     setDocxHtml("");
-    getArrayBuffer(`/attachments/${attachment.id}/content`)
+    getArrayBuffer(attachmentContentUrl(attachment.id))
       .then((buffer) => mammoth.convertToHtml({ arrayBuffer: buffer }))
       .then((result) => {
         if (isActive) {
@@ -122,7 +122,7 @@ export default function AttachmentViewer({
     return () => {
       isActive = false;
     };
-  }, [attachment.type, attachment.url, isDocx]);
+  }, [attachment.id, attachment.type, isDocx]);
 
   React.useEffect(() => {
     if (!isMenuOpen) return;

@@ -10,6 +10,7 @@ type ComposerProps = {
   disabled?: boolean;
   isStreaming?: boolean;
   onSendMessage: (message: string, useDocs: boolean) => void;
+  onStop?: () => void;
   onAttachFiles: (files: FileList) => void;
   useDocs: boolean;
   onToggleUseDocs: (value: boolean) => void;
@@ -21,6 +22,7 @@ export default function Composer({
   disabled,
   isStreaming,
   onSendMessage,
+  onStop,
   onAttachFiles,
   useDocs,
   onToggleUseDocs,
@@ -112,12 +114,18 @@ export default function Composer({
           <div className="flex w-fit flex-col items-end gap-1 self-end">
             <Button
               type="button"
-              onClick={handleSend}
-              disabled={disabled || isStreaming || !value.trim()}
+              onClick={() => (isStreaming ? onStop?.() : handleSend())}
+              disabled={disabled || (!isStreaming && !value.trim())}
               className="h-11 rounded-2xl px-5"
             >
-              <SendHorizontal className="h-4 w-4" />
-              Send
+              {isStreaming ? (
+                "Stop"
+              ) : (
+                <>
+                  <SendHorizontal className="h-4 w-4" />
+                  Send
+                </>
+              )}
             </Button>
             <span className="self-start text-left text-xs text-muted">
               {useDocs ? "Use documents" : "General answer"}

@@ -40,7 +40,7 @@ app.add_middleware(
 
 # ---- Configuration ----
 DEFAULT_PROVIDER = os.getenv("LLM_PROVIDER", "openai")
-DEFAULT_OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+DEFAULT_OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-nano")
 DEFAULT_VLLM_MODEL = os.getenv("VLLM_MODEL_NAME", "qwen-3")
 MAX_TURNS = int(os.getenv("MAX_TURNS", "8"))
 MAX_PINNED = 5
@@ -346,6 +346,10 @@ def generate_answer(
     )
     verdict = (vdebug or {}).get("verdict", "UNSUPPORTED")
     confidence = (vdebug or {}).get("confidence", 0.0)
+    if context and verdict == "UNSUPPORTED":
+        verdict = "PARTIAL"
+        final_answer = draft
+        confidence = min(float(confidence or 0.0), 0.55)
 
     citations = build_citations(evidence_hits, verdict)
     evidence = build_evidence(evidence_hits, verdict)
@@ -630,6 +634,7 @@ async def stream_message(
 
     def event_builder():
         try:
+            yield f"event: message.status\ndata: {json.dumps({'status': 'thinking'})}\n\n"
             answer, meta, reason = generate_answer(
                 db=db,
                 conversation=conv,
@@ -656,7 +661,15 @@ async def stream_message(
         except Exception as exc:
             yield f"event: error\ndata: {json.dumps({'message': str(exc)})}\n\n"
 
-    return StreamingResponse(event_builder(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_builder(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/conversations/{conversation_id}/attachments")
@@ -765,16 +778,18 @@ def download_attachment(attachment_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Attachment not found.")
     if not os.path.exists(attachment.path):
         raise HTTPException(status_code=404, detail="Attachment file missing on disk.")
-    type_map = {
+    mime_map = {
         "pdf": "application/pdf",
-        "txt": "text/plain",
+        "txt": "text/plain; charset=utf-8",
         "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     }
     attachment_type = (attachment.type or "").lower()
+    media_type = mime_map.get(attachment_type, "application/octet-stream")
     return FileResponse(
         attachment.path,
         filename=attachment.name,
-        media_type=type_map.get(attachment_type, "application/octet-stream"),
+        media_type=media_type,
+        headers={"Content-Disposition": f'inline; filename="{attachment.name}"'},
     )
 
 

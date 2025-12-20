@@ -26,23 +26,19 @@ def verify_answer(
     excerpts = _trim(context, 7000)
 
     judge_system = (
-        "You are a judge evaluating whether an answer is supported by the provided document excerpts.\n"
-        "Be strict enough to avoid hallucinations, but NOT overly strict.\n"
-        "The assistant is allowed to use common sense and make reasonable assumptions ONLY if they are consistent with the excerpts.\n\n"
-        "FINAL must be a normal assistant reply in natural language. Do not mention or hint at drafts, excerpts, judges, verification, or evaluation.\n"
-        "Do not include any meta commentary. Do not refer to the existence of verification steps.\n"
-        "If VERDICT is UNSUPPORTED, FINAL must equal the refusal text exactly and nothing else.\n\n"
-        "Your job:\n"
-        "1) Decide if the DRAFT answers the QUESTION.\n"
-        "2) Decide if the DRAFT is supported by the EXCERPTS.\n\n"
-        "Verdicts:\n"
-        "- SUPPORTED: answers the question and is supported (paraphrase ok).\n"
-        "- PARTIAL: some support exists, but incomplete or slightly speculative. Rewrite to hedge and be precise.\n"
-        "- UNSUPPORTED: not enough support to answer. Use the refusal text.\n\n"
+        "You are verifying an assistant answer using academic document excerpts.\n\n"
+        "Rules for FINAL:\n"
+        "- FINAL must be a normal, natural assistant response to the user.\n"
+        "- FINAL must NOT mention the words: DRAFT, EXCERPTS, VERDICT, CONFIDENCE, judge, verifier.\n"
+        "- FINAL must NOT talk about what is supported/unsupported. Just answer normally.\n"
+        "- If unsupported, FINAL must be exactly the refusal text.\n\n"
+        "Grounding rules:\n"
+        "- Allow paraphrase and synthesis across excerpts.\n"
+        "- Do NOT require verbatim matches.\n\n"
         "Output format EXACTLY:\n"
         "VERDICT: <SUPPORTED|PARTIAL|UNSUPPORTED>\n"
         "CONFIDENCE: <0.00-1.00>\n"
-        "FINAL: <one paragraph final answer>\n"
+        "FINAL: <one paragraph natural answer to the user>\n"
     )
 
     judge_user = (
@@ -81,6 +77,33 @@ def verify_answer(
     m_f = re.search(r"FINAL:\s*(.*)$", text, flags=re.S)
     if m_f:
         final = m_f.group(1).strip()
+
+    BAD_PREFIXES = (
+        "the draft",
+        "draft is",
+        "the provided material",
+        "the excerpts",
+        "the answer is",
+        "this is supported",
+        "supported by",
+        "unsupported",
+    )
+
+    def _sanitize_final(text: str) -> str:
+        t = (text or "").strip()
+        low = t.lower()
+        if any(low.startswith(prefix) for prefix in BAD_PREFIXES):
+            return ""
+        if "draft" in low or "excerpts" in low:
+            return ""
+        return t
+
+    sanitized = _sanitize_final(final)
+    if not sanitized and verdict != "UNSUPPORTED":
+        sanitized = (draft or "").strip()
+    if not sanitized:
+        sanitized = refusal_text if verdict == "UNSUPPORTED" else (draft or "")
+    final = sanitized
 
     # Safety fallbacks:
     if verdict == "UNSUPPORTED":

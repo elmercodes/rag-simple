@@ -12,6 +12,16 @@ type MessageBubbleProps = {
 
 export default function MessageBubble({ message }: MessageBubbleProps) {
   const isUser = message.role === "user";
+  const evidenceItems =
+    !isUser && message.useDocs
+      ? (message.evidence ?? []).slice(0, 3)
+      : [];
+  const hasEvidence = evidenceItems.length > 0;
+  const trimExcerpt = (value?: string | null) => {
+    if (!value) return "";
+    const cleaned = value.trim();
+    return cleaned.length > 320 ? `${cleaned.slice(0, 317)}...` : cleaned;
+  };
 
   return (
     <div
@@ -54,6 +64,42 @@ export default function MessageBubble({ message }: MessageBubbleProps) {
             <span className="text-xs">Generating response...</span>
           </div>
         )}
+        {!isUser && hasEvidence ? (
+          <div className="mt-4 rounded-2xl border border-border/70 bg-panel/70 p-4 text-xs text-ink shadow-soft">
+            <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-muted">
+              Relevant excerpts
+            </div>
+            <div className="space-y-3">
+              {evidenceItems.map((item, index) => {
+                const rank =
+                  typeof item.rank === "number" ? item.rank : index + 1;
+                const name = item.filename || "Attachment";
+                const pageLabel =
+                  typeof item.page === "number" ? `p. ${item.page}` : null;
+                const excerpt = trimExcerpt(item.excerpt);
+                return (
+                  <div
+                    key={`${item.attachmentId}-${index}`}
+                    className="rounded-xl border border-border/60 bg-card/70 p-3"
+                  >
+                    <div className="mb-2 flex items-center gap-2 text-[11px] uppercase tracking-[0.16em] text-muted">
+                      <span className="rounded-full bg-accent/60 px-2 py-0.5 text-[10px] text-ink">
+                        {rank}
+                      </span>
+                      <span className="truncate">{name}</span>
+                      {pageLabel ? (
+                        <span className="text-muted">{pageLabel}</span>
+                      ) : null}
+                    </div>
+                    <div className="text-xs text-ink">
+                      {excerpt || "Excerpt unavailable."}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        ) : null}
       </div>
       {isUser && (
         <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-accent/80 text-ink">

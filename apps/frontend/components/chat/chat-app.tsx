@@ -29,6 +29,10 @@ export type Message = {
   createdAt?: string;
   isStreaming?: boolean;
   useDocs?: boolean;
+  citations?: BackendMessage["citations"];
+  evidence?: BackendMessage["evidence"];
+  meta?: BackendMessage["meta"];
+  warning?: string;
 };
 
 export type Attachment = {
@@ -65,6 +69,21 @@ type BackendMessage = {
   content: string;
   createdAt: string;
   useDocs?: boolean;
+  citations?: Array<{ attachmentId: number | string; page?: number | null }>;
+  evidence?: Array<{
+    attachmentId: number | string;
+    page?: number | null;
+    excerpt?: string | null;
+    filename?: string | null;
+    rank?: number;
+  }>;
+  meta?: {
+    answerMode?: "rag" | "direct" | string;
+    verdict?: "SUPPORTED" | "PARTIAL" | "UNSUPPORTED" | string | null;
+    confidence?: number | null;
+    warning?: string | null;
+  };
+  warning?: string;
 };
 
 type BackendAttachment = {
@@ -98,7 +117,11 @@ const normalizeMessage = (payload: BackendMessage): Message => ({
   role: payload.role,
   content: payload.content,
   createdAt: payload.createdAt,
-  useDocs: payload.useDocs
+  useDocs: payload.useDocs,
+  citations: payload.citations ?? [],
+  evidence: payload.evidence ?? [],
+  meta: payload.meta ?? {},
+  warning: payload.warning
 });
 
 const normalizeAttachment = (payload: BackendAttachment): Attachment => {
@@ -174,6 +197,8 @@ export default function ChatApp() {
     Record<string, boolean>
   >({});
   const attachmentCountRef = React.useRef<Record<string, number>>({});
+  const abortControllersRef = React.useRef<Record<string, AbortController>>({});
+  const abortRequestedRef = React.useRef<Record<string, boolean>>({});
 
   const activeConversation = conversations.find(
     (conversation) => conversation.id === activeId
@@ -480,16 +505,43 @@ export default function ChatApp() {
       return;
     }
 
-    const stream = streamSSE<{ delta?: string; message?: string } | BackendMessage>(
+    abortRequestedRef.current[conversationId] = false;
+    const controller = new AbortController();
+    abortControllersRef.current[conversationId] = controller;
+
+    const stream = streamSSE<
+      { delta?: string; message?: string; status?: string } | BackendMessage
+    >(
       `/conversations/${conversationId}/messages:stream`,
-      { content: trimmed, useDocs: shouldUseDocs }
+      {
+        content: trimmed,
+        useDocs: shouldUseDocs
+      },
+      { signal: controller.signal }
     );
 
     let hadStreamError = false;
     let finalReceived = false;
+    let wasAborted = false;
 
     try {
       for await (const event of stream) {
+        if (abortRequestedRef.current[conversationId]) {
+          wasAborted = true;
+          break;
+        }
+        if (event.event === "message.status") {
+          setStreamingByConversation((prev) => {
+            const current = prev[conversationId];
+            if (current && current.content.length > 0) {
+              return prev;
+            }
+            return {
+              ...prev,
+              [conversationId]: { content: "" }
+            };
+          });
+        }
         if (event.event === "message.delta" && "delta" in event.data) {
           const delta = event.data.delta ?? "";
           setStreamingByConversation((prev) => {
@@ -527,14 +579,19 @@ export default function ChatApp() {
         }
       }
     } catch (error) {
-      hadStreamError = true;
+      const isAbort =
+        error instanceof DOMException && error.name === "AbortError";
+      wasAborted = isAbort;
+      hadStreamError = !isAbort;
       setStreamingByConversation((prev) => {
         const next = { ...prev };
         delete next[conversationId];
         return next;
       });
-      showToast("Streaming failed.");
-      console.error(error);
+      if (!isAbort) {
+        showToast("Streaming failed.");
+        console.error(error);
+      }
     }
 
     if (!finalReceived) {
@@ -543,6 +600,13 @@ export default function ChatApp() {
         delete next[conversationId];
         return next;
       });
+    }
+
+    delete abortControllersRef.current[conversationId];
+    delete abortRequestedRef.current[conversationId];
+
+    if (wasAborted) {
+      return;
     }
 
     if (hadStreamError) {
@@ -570,6 +634,40 @@ export default function ChatApp() {
       await loadMessages(conversationId);
     }
   };
+
+  const handleStopStreaming = React.useCallback(() => {
+    if (!activeConversation) return;
+    const conversationId = activeConversation.id;
+    abortRequestedRef.current[conversationId] = true;
+
+    const partial = streamingByConversation[conversationId]?.content ?? "";
+    if (partial.trim()) {
+      updateConversation(conversationId, (conversation) => ({
+        ...conversation,
+        messages: [
+          ...conversation.messages,
+          {
+            id: `tmp-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`}`,
+            role: "assistant",
+            content: partial,
+            createdAt: new Date().toISOString()
+          }
+        ]
+      }));
+    }
+
+    const controller = abortControllersRef.current[conversationId];
+    if (controller) {
+      controller.abort();
+      delete abortControllersRef.current[conversationId];
+    }
+
+    setStreamingByConversation((prev) => {
+      const next = { ...prev };
+      delete next[conversationId];
+      return next;
+    });
+  }, [activeConversation, streamingByConversation, updateConversation]);
 
   const handleSelectConversation = (id: string) => {
     setActiveId(id);
@@ -1040,6 +1138,7 @@ export default function ChatApp() {
         <Composer
           disabled={!activeConversation}
           isStreaming={isStreaming}
+          onStop={handleStopStreaming}
           isUploadingAttachments={
             activeConversation
               ? Boolean(uploadingByConversation[activeConversation.id])
