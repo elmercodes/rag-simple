@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from fastapi import Body, Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -25,6 +26,17 @@ from backend.app.verification import verify_answer
 
 
 app = FastAPI(title="RAG Backend API")
+
+# ---- CORS ----
+cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000")
+allowed_origins = [origin.strip() for origin in cors_origins.split(",") if origin.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE"],
+    allow_headers=["Content-Type", "Authorization"],
+)
 
 # ---- Configuration ----
 DEFAULT_PROVIDER = os.getenv("LLM_PROVIDER", "openai")
@@ -753,10 +765,16 @@ def download_attachment(attachment_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Attachment not found.")
     if not os.path.exists(attachment.path):
         raise HTTPException(status_code=404, detail="Attachment file missing on disk.")
+    type_map = {
+        "pdf": "application/pdf",
+        "txt": "text/plain",
+        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    }
+    attachment_type = (attachment.type or "").lower()
     return FileResponse(
         attachment.path,
         filename=attachment.name,
-        media_type=attachment.type or "application/octet-stream",
+        media_type=type_map.get(attachment_type, "application/octet-stream"),
     )
 
 

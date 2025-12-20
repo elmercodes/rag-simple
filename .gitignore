@@ -24,3 +24,4 @@ data/vector_store/
 
 # Folder
 node_modules/
+.env

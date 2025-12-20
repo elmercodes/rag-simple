@@ -152,6 +152,7 @@ export default function ChatApp() {
   );
   const [toastMessage, setToastMessage] = React.useState<string | null>(null);
   const [lastApiError, setLastApiError] = React.useState<string | null>(null);
+  const [initialLoadFailed, setInitialLoadFailed] = React.useState(false);
   const [isWideLayout, setIsWideLayout] = React.useState(true);
   const [mounted, setMounted] = React.useState(false);
   const [selectedModel, setSelectedModel] =
@@ -268,16 +269,25 @@ export default function ChatApp() {
   }, [reportApiError, updateConversation]);
 
   const loadAttachments = React.useCallback(async (conversationId: string) => {
-    const data = await getJson<BackendAttachment[]>(
-      `/conversations/${conversationId}/attachments`
-    );
-    updateConversation(conversationId, (conversation) => ({
-      ...conversation,
-      attachments: data.map(normalizeAttachment)
-    }));
-  }, [updateConversation]);
+    try {
+      const data = await getJson<BackendAttachment[]>(
+        `/conversations/${conversationId}/attachments`
+      );
+      updateConversation(conversationId, (conversation) => ({
+        ...conversation,
+        attachments: data.map(normalizeAttachment)
+      }));
+      return data;
+    } catch (error) {
+      reportApiError(
+        `GET /conversations/${conversationId}/attachments`,
+        error
+      );
+      throw error;
+    }
+  }, [reportApiError, updateConversation]);
 
-  const handleNewChat = async () => {
+  const handleNewChat = React.useCallback(async () => {
     try {
       const data = await postJson<BackendConversation>("/conversations");
       const newConversation = normalizeConversation(data);
@@ -293,7 +303,21 @@ export default function ChatApp() {
       showToast("Unable to create a new conversation.");
       console.error(error);
     }
-  };
+  }, [loadAttachments, loadMessages, reportApiError, showToast]);
+
+  const handleRetryLoad = React.useCallback(async () => {
+    setInitialLoadFailed(false);
+    try {
+      const data = await refreshConversations();
+      if (data.length === 0) {
+        await handleNewChat();
+      }
+    } catch (error) {
+      setInitialLoadFailed(true);
+      showToast("Backend unreachable. Check NEXT_PUBLIC_API_BASE_URL.");
+      console.error(error);
+    }
+  }, [handleNewChat, refreshConversations, showToast]);
 
   const handleRenameConversation = async (id: string, title: string) => {
     const nextTitle = title.trim();
@@ -686,47 +710,6 @@ export default function ChatApp() {
   }, [selectedModel, mounted]);
 
   React.useEffect(() => {
-    if (!mounted) return;
-    let isActive = true;
-    const load = async () => {
-      try {
-        const settings = await getJson<{ theme: Theme | null; useDocs: boolean }>(
-          "/settings"
-        );
-        if (!isActive) return;
-        if (settings.theme === "light" || settings.theme === "dark") {
-          setTheme(settings.theme);
-        }
-        setUseDocsDefaults(Boolean(settings.useDocs));
-      } catch (error) {
-        console.error(error);
-      }
-
-      try {
-        const data = await refreshConversations();
-        if (!isActive) return;
-        if (data.length === 0) {
-          await handleNewChat();
-        }
-      } catch (error) {
-        showToast("Unable to load conversations.");
-        console.error(error);
-        try {
-          await handleNewChat();
-        } catch (fallbackError) {
-          console.error(fallbackError);
-        }
-      }
-    };
-
-    load();
-
-    return () => {
-      isActive = false;
-    };
-  }, [mounted, refreshConversations, setTheme, showToast]);
-
-  React.useEffect(() => {
     if (!activeId) return;
     let isActive = true;
     const load = async () => {
@@ -771,6 +754,44 @@ export default function ChatApp() {
       return prev;
     });
   }, [activeConversation, useDocsDefaults]);
+
+  React.useEffect(() => {
+    if (!mounted) return;
+    let isActive = true;
+    const load = async () => {
+      try {
+        const settings = await getJson<{ theme: Theme | null; useDocs: boolean }>(
+          "/settings"
+        );
+        if (!isActive) return;
+        if (settings.theme === "light" || settings.theme === "dark") {
+          setTheme(settings.theme);
+        }
+        setUseDocsDefaults(Boolean(settings.useDocs));
+      } catch (error) {
+        console.error(error);
+      }
+
+      try {
+        const data = await refreshConversations();
+        if (!isActive) return;
+        if (data.length === 0) {
+          await handleNewChat();
+        }
+        setInitialLoadFailed(false);
+      } catch (error) {
+        showToast("Backend unreachable. Check NEXT_PUBLIC_API_BASE_URL.");
+        setInitialLoadFailed(true);
+        console.error(error);
+      }
+    };
+
+    load();
+
+    return () => {
+      isActive = false;
+    };
+  }, [handleNewChat, mounted, refreshConversations, setTheme, showToast]);
 
   const handleThemeSelect = async (value: Theme) => {
     setTheme(value);
@@ -939,6 +960,21 @@ export default function ChatApp() {
               : null
           }
         />
+        {initialLoadFailed && !activeConversation ? (
+          <div className="mx-6 mb-4 rounded-2xl border border-border bg-card/80 p-4 text-sm text-ink shadow-soft">
+            <div className="font-semibold">
+              Backend unreachable. Check NEXT_PUBLIC_API_BASE_URL.
+            </div>
+            <div className="mt-2 text-xs text-muted">
+              You can retry once the backend is running.
+            </div>
+            <div className="mt-3">
+              <Button type="button" onClick={handleRetryLoad}>
+                Retry connection
+              </Button>
+            </div>
+          </div>
+        ) : null}
         <Composer
           disabled={!activeConversation}
           isStreaming={isStreaming}
