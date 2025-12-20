@@ -65,7 +65,6 @@ The UI is designed to feel familiar to ChatGPT while remaining lightweight, exte
 - Tailwind CSS
 - shadcn/ui + Radix
 - Client-side DOCX parsing (docx-preview / mammoth)
-- Local demo assets via `/public`
 
 ## 📁 Project Structure (Simplified)
 
@@ -88,19 +87,6 @@ lib/
   utils.ts
 ```
 
-## 🧪 Demo Assets
-
-For development and testing, the app includes demo attachments:
-
-```
-public/
-  demo.pdf
-  demo.txt
-  demo.docx
-```
-
-These are used to validate the attachment viewer and file-switching behavior.
-
 ## Getting started
 
 ### Requirements
@@ -119,7 +105,7 @@ Then open `http://localhost:3000`.
 
 ## Configuration
 
-The app reads an optional API base URL for future backend integration:
+The app reads an optional API base URL for backend integration:
 
 ```
 NEXT_PUBLIC_API_BASE_URL=
@@ -127,5 +113,4 @@ NEXT_PUBLIC_API_BASE_URL=
 
 ## Notes
 
-- The chat flow uses a mock streaming API (`lib/mockApi.ts`) with TODOs for real backend integration.
-- File uploads are UI-only for now and are stored in client state.
+- Conversations, messages, attachments, and settings load from the backend API.

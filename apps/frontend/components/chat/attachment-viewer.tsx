@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import type { Attachment } from "@/components/chat/chat-app";
 import { cn } from "@/lib/utils";
+import { attachmentContentUrl, getArrayBuffer, getText } from "@/lib/api";
 
 type AttachmentViewerProps = {
   attachment: Attachment;
@@ -51,7 +52,7 @@ export default function AttachmentViewer({
       return;
     }
 
-    if (!attachment.url) {
+    if (!attachment.id) {
       setTextContent("Preview unavailable.");
       setIsLoadingText(false);
       return;
@@ -59,8 +60,7 @@ export default function AttachmentViewer({
 
     let isActive = true;
     setIsLoadingText(true);
-    fetch(attachment.url)
-      .then((response) => response.text())
+    getText(`/attachments/${attachment.id}/content`)
       .then((text) => {
         if (isActive) {
           setTextContent(text);
@@ -90,7 +90,7 @@ export default function AttachmentViewer({
       return;
     }
 
-    if (!attachment.url) {
+    if (!attachment.id) {
       setDocxHtml("");
       setDocxError(true);
       setIsLoadingDocx(false);
@@ -101,8 +101,7 @@ export default function AttachmentViewer({
     setIsLoadingDocx(true);
     setDocxError(false);
     setDocxHtml("");
-    fetch(attachment.url)
-      .then((response) => response.arrayBuffer())
+    getArrayBuffer(`/attachments/${attachment.id}/content`)
       .then((buffer) => mammoth.convertToHtml({ arrayBuffer: buffer }))
       .then((result) => {
         if (isActive) {
@@ -255,11 +254,11 @@ export default function AttachmentViewer({
       <ScrollArea className="flex-1">
         <div className="space-y-4 p-4">
           {isPdf ? (
-            attachment.url ? (
+            attachment.id ? (
               <div className="h-[70vh] w-full overflow-hidden rounded-2xl border border-border bg-card">
                 <iframe
                   title={attachment.name}
-                  src={attachment.url}
+                  src={attachmentContentUrl(attachment.id)}
                   className="h-full w-full"
                 />
               </div>

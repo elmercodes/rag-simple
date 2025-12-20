@@ -1,7 +1,6 @@
 "use client";
 
 import * as React from "react";
-import { mockStreamAssistantReply } from "@/lib/mockApi";
 import Sidebar from "@/components/chat/sidebar";
 import ChatThread from "@/components/chat/chat-thread";
 import Composer from "@/components/chat/composer";
@@ -11,11 +10,23 @@ import { Button } from "@/components/ui/button";
 import { useTheme, type Theme } from "@/components/theme-provider";
 import { Settings, Moon, Sun, PanelLeft, X } from "lucide-react";
 import { cn } from "@/lib/utils";
+import {
+  ApiError,
+  attachmentContentUrl,
+  deleteJson,
+  getJson,
+  patchJson,
+  postJson,
+  putJson,
+  streamSSE,
+  uploadFile
+} from "@/lib/api";
 
 export type Message = {
-  id: string;
+  id?: string;
   role: "user" | "assistant";
   content: string;
+  createdAt?: string;
   isStreaming?: boolean;
   useDocs?: boolean;
 };
@@ -25,6 +36,7 @@ export type Attachment = {
   name: string;
   type: "pdf" | "txt" | "doc" | "docx";
   url: string;
+  createdAt?: string;
 };
 
 export type AIModel = "gpt-5-nano" | "Qwen3";
@@ -34,105 +46,101 @@ export type Conversation = {
   title: string;
   messages: Message[];
   attachments: Attachment[];
-  createdAt: number;
-  lastUpdatedAt: number;
+  createdAt: string;
+  lastUpdatedAt: string;
   isPinned: boolean;
-  pinnedAt: number | null;
+  pinnedAt: string | null;
+  pinnedOrder: number | null;
 };
 
-const seedTimestamp = 1_700_000_000_000;
-const seedConversations: Conversation[] = [
-  {
-    id: "conv-aurora",
-    title: "Aurora launch plan",
-    attachments: [
-      {
-        id: "file-1",
-        name: "product-brief.pdf",
-        type: "pdf",
-        url: "/demo.pdf"
-      },
-      {
-        id: "file-2",
-        name: "kickoff-notes.txt",
-        type: "txt",
-        url: "/demo.txt"
-      },
-      {
-        id: "file-3",
-        name: "demo.docx",
-        type: "docx",
-        url: "/demo.docx"
-      }
-    ],
-    messages: [
-      {
-        id: "msg-1",
-        role: "assistant",
-        content:
-          "Welcome back. Want me to draft a launch timeline, or start with a press-ready overview?"
-      },
-      {
-        id: "msg-2",
-        role: "user",
-        content: "Start with a timeline and include key risks."
-      }
-    ],
-    createdAt: seedTimestamp - 1000 * 60 * 60 * 2,
-    lastUpdatedAt: seedTimestamp - 1000 * 60 * 45,
-    isPinned: false,
-    pinnedAt: null
-  },
-  {
-    id: "conv-research",
-    title: "Research recap",
-    attachments: [],
-    messages: [
-      {
-        id: "msg-3",
-        role: "assistant",
-        content:
-          "I summarized the top findings and highlighted the gaps you can validate next week."
-      }
-    ],
-    createdAt: seedTimestamp - 1000 * 60 * 60 * 6,
-    lastUpdatedAt: seedTimestamp - 1000 * 60 * 60 * 3,
-    isPinned: false,
-    pinnedAt: null
-  }
-];
+type ConversationPayload = Omit<Conversation, "messages" | "attachments">;
 
-const createId = () =>
-  typeof crypto !== "undefined" && "randomUUID" in crypto
-    ? crypto.randomUUID()
-    : Math.random().toString(36).slice(2);
+type BackendConversation = Omit<ConversationPayload, "id"> & {
+  id: number;
+};
 
-const sortPinnedConversations = (
-  list: Conversation[],
-  order: string[]
-) =>
+type BackendMessage = {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  createdAt: string;
+  useDocs?: boolean;
+};
+
+type BackendAttachment = {
+  id: number;
+  name: string;
+  type: string | null;
+  createdAt?: string;
+};
+
+const timestamp = (value?: string | null) =>
+  value ? Date.parse(value) : 0;
+
+const normalizeConversation = (
+  payload: BackendConversation,
+  current?: Conversation
+): Conversation => ({
+  id: String(payload.id),
+  title: payload.title,
+  createdAt: payload.createdAt,
+  lastUpdatedAt: payload.lastUpdatedAt,
+  isPinned: payload.isPinned,
+  pinnedAt: payload.pinnedAt ?? null,
+  pinnedOrder:
+    typeof payload.pinnedOrder === "number" ? payload.pinnedOrder : null,
+  messages: current?.messages ?? [],
+  attachments: current?.attachments ?? []
+});
+
+const normalizeMessage = (payload: BackendMessage): Message => ({
+  id: payload.id,
+  role: payload.role,
+  content: payload.content,
+  createdAt: payload.createdAt,
+  useDocs: payload.useDocs
+});
+
+const normalizeAttachment = (payload: BackendAttachment): Attachment => {
+  const rawType = (payload.type || "").toLowerCase();
+  const type =
+    rawType === "pdf" ||
+    rawType === "txt" ||
+    rawType === "doc" ||
+    rawType === "docx"
+      ? rawType
+      : "doc";
+  return {
+    id: String(payload.id),
+    name: payload.name,
+    type,
+    url: attachmentContentUrl(payload.id),
+    createdAt: payload.createdAt
+  };
+};
+
+const sortPinnedConversations = (list: Conversation[]) =>
   [...list]
     .filter((conversation) => conversation.isPinned)
     .sort((a, b) => {
-      const aIndex = order.indexOf(a.id);
-      const bIndex = order.indexOf(b.id);
-      if (aIndex !== -1 && bIndex !== -1) return aIndex - bIndex;
-      if (aIndex !== -1) return -1;
-      if (bIndex !== -1) return 1;
-      return (b.pinnedAt ?? 0) - (a.pinnedAt ?? 0);
+      const aOrder = a.pinnedOrder ?? Number.MAX_SAFE_INTEGER;
+      const bOrder = b.pinnedOrder ?? Number.MAX_SAFE_INTEGER;
+      if (aOrder !== bOrder) return aOrder - bOrder;
+      return timestamp(b.pinnedAt) - timestamp(a.pinnedAt);
     });
 
 const sortUnpinnedConversations = (list: Conversation[]) =>
   [...list]
     .filter((conversation) => !conversation.isPinned)
     .sort((a, b) => {
-      if (a.lastUpdatedAt !== b.lastUpdatedAt) {
-        return b.lastUpdatedAt - a.lastUpdatedAt;
-      }
-      return b.createdAt - a.createdAt;
+      const lastUpdated = timestamp(b.lastUpdatedAt) - timestamp(a.lastUpdatedAt);
+      if (lastUpdated !== 0) return lastUpdated;
+      return timestamp(b.createdAt) - timestamp(a.createdAt);
     });
 
 export default function ChatApp() {
+  const streamingEnabled =
+    process.env.NEXT_PUBLIC_STREAMING_ENABLED !== "false";
   const { theme, setTheme } = useTheme();
   const [isSettingsOpen, setIsSettingsOpen] = React.useState(false);
   const settingsRef = React.useRef<HTMLDivElement>(null);
@@ -143,45 +151,29 @@ export default function ChatApp() {
     null
   );
   const [toastMessage, setToastMessage] = React.useState<string | null>(null);
+  const [lastApiError, setLastApiError] = React.useState<string | null>(null);
   const [isWideLayout, setIsWideLayout] = React.useState(true);
-  const [pinnedOrder, setPinnedOrder] = React.useState<string[]>([]);
-  const [useDocs, setUseDocs] = React.useState<boolean>(true);
   const [mounted, setMounted] = React.useState(false);
   const [selectedModel, setSelectedModel] =
     React.useState<AIModel>("gpt-5-nano");
+  const [useDocsDefaults, setUseDocsDefaults] = React.useState(true);
 
-  const [conversations, setConversations] = React.useState<Conversation[]>(
-    seedConversations
-  );
-  const [activeId, setActiveId] = React.useState(seedConversations[0].id);
-
-  const createConversation = React.useCallback((): Conversation => {
-    const now = Date.now();
-    return {
-      id: createId(),
-      title: "New chat",
-      attachments: [],
-      messages: [
-        {
-          id: createId(),
-          role: "assistant",
-          content:
-            "Tell me what you want to build, and I will help you map the next steps."
-        }
-      ],
-      createdAt: now,
-      lastUpdatedAt: now,
-      isPinned: false,
-      pinnedAt: null
-    };
-  }, []);
+  const [conversations, setConversations] = React.useState<Conversation[]>([]);
+  const [activeId, setActiveId] = React.useState<string | null>(null);
+  const [useDocsByConversation, setUseDocsByConversation] = React.useState<
+    Record<string, boolean>
+  >({});
+  const [streamingByConversation, setStreamingByConversation] = React.useState<
+    Record<string, { content: string }>
+  >({});
+  const attachmentCountRef = React.useRef<Record<string, number>>({});
 
   const activeConversation = conversations.find(
     (conversation) => conversation.id === activeId
   );
   const pinnedConversations = React.useMemo(
-    () => sortPinnedConversations(conversations, pinnedOrder),
-    [conversations, pinnedOrder]
+    () => sortPinnedConversations(conversations),
+    [conversations]
   );
   const unpinnedConversations = React.useMemo(
     () => sortUnpinnedConversations(conversations),
@@ -209,164 +201,406 @@ export default function ChatApp() {
     }, 2200);
   }, []);
 
-  const handleNewChat = () => {
-    const newConversation = createConversation();
+  const reportApiError = React.useCallback((context: string, error: unknown) => {
+    if (process.env.NODE_ENV === "production") return;
+    if (error instanceof ApiError) {
+      const detail =
+        typeof error.details === "string"
+          ? error.details
+          : JSON.stringify(error.details ?? {});
+      console.error(`[API] ${context}`, {
+        status: error.status,
+        message: error.message,
+        detail
+      });
+      setLastApiError(
+        `${context}: ${error.status} ${error.message}${detail ? ` — ${detail}` : ""}`
+      );
+      return;
+    }
+    console.error(`[API] ${context}`, error);
+    setLastApiError(`${context}: ${String(error)}`);
+  }, []);
 
-    setConversations((prev) => [newConversation, ...prev]);
-    setActiveId(newConversation.id);
-    setIsSidebarOpen(false);
+  const syncConversations = React.useCallback(
+    (payload: BackendConversation[]) => {
+      setConversations((prev) => {
+        const prevMap = new Map(prev.map((conv) => [conv.id, conv]));
+        return payload.map((item) =>
+          normalizeConversation(item, prevMap.get(String(item.id)))
+        );
+      });
+      if (!activeId && payload.length > 0) {
+        setActiveId(String(payload[0].id));
+      }
+    },
+    [activeId]
+  );
+
+  const refreshConversations = React.useCallback(async () => {
+    try {
+      const data = await getJson<BackendConversation[]>("/conversations");
+      syncConversations(data);
+      return data;
+    } catch (error) {
+      reportApiError("GET /conversations", error);
+      throw error;
+    }
+  }, [reportApiError, syncConversations]);
+
+  const loadMessages = React.useCallback(async (conversationId: string) => {
+    try {
+      const data = await getJson<BackendMessage[]>(
+        `/conversations/${conversationId}/messages`
+      );
+      updateConversation(conversationId, (conversation) => ({
+        ...conversation,
+        messages: data.map(normalizeMessage)
+      }));
+      return data;
+    } catch (error) {
+      reportApiError(
+        `GET /conversations/${conversationId}/messages`,
+        error
+      );
+      throw error;
+    }
+  }, [reportApiError, updateConversation]);
+
+  const loadAttachments = React.useCallback(async (conversationId: string) => {
+    const data = await getJson<BackendAttachment[]>(
+      `/conversations/${conversationId}/attachments`
+    );
+    updateConversation(conversationId, (conversation) => ({
+      ...conversation,
+      attachments: data.map(normalizeAttachment)
+    }));
+  }, [updateConversation]);
+
+  const handleNewChat = async () => {
+    try {
+      const data = await postJson<BackendConversation>("/conversations");
+      const newConversation = normalizeConversation(data);
+      setConversations((prev) => [newConversation, ...prev]);
+      setActiveId(newConversation.id);
+      await Promise.all([
+        loadMessages(newConversation.id),
+        loadAttachments(newConversation.id)
+      ]);
+      setIsSidebarOpen(false);
+    } catch (error) {
+      reportApiError("POST /conversations", error);
+      showToast("Unable to create a new conversation.");
+      console.error(error);
+    }
   };
 
-  const handleRenameConversation = (id: string, title: string) => {
+  const handleRenameConversation = async (id: string, title: string) => {
     const nextTitle = title.trim();
     if (!nextTitle) return;
+    const previous = conversations.find((item) => item.id === id);
+    if (!previous) return;
+
     updateConversation(id, (conversation) => ({
       ...conversation,
       title: nextTitle
     }));
-  };
 
-  const resolveAttachmentType = (name: string): Attachment["type"] => {
-    const extension = name.split(".").pop()?.toLowerCase();
-    switch (extension) {
-      case "pdf":
-        return "pdf";
-      case "txt":
-        return "txt";
-      case "doc":
-        return "doc";
-      case "docx":
-        return "docx";
-      default:
-        return "doc";
+    try {
+      const data = await patchJson<BackendConversation>(`/conversations/${id}`,
+        { title: nextTitle }
+      );
+      updateConversation(id, (conversation) =>
+        normalizeConversation(data, conversation)
+      );
+    } catch (error) {
+      updateConversation(id, () => previous);
+      showToast("Failed to rename conversation.");
+      console.error(error);
     }
   };
 
-  const handleAttachFiles = (files: FileList) => {
+  const handleAttachFiles = async (files: FileList) => {
     if (!activeConversation || files.length === 0) return;
-    const newAttachments: Attachment[] = Array.from(files).map((file) => ({
-      id: createId(),
-      name: file.name,
-      type: resolveAttachmentType(file.name),
-      url: URL.createObjectURL(file)
-    }));
+    const conversationId = activeConversation.id;
 
-    updateConversation(activeConversation.id, (conversation) => ({
-      ...conversation,
-      attachments: [...newAttachments, ...conversation.attachments]
-    }));
+    const uploads = Array.from(files).map(async (file) => {
+      try {
+        const data = await uploadFile<BackendAttachment>(
+          `/conversations/${conversationId}/attachments`,
+          file
+        );
+        const attachment = normalizeAttachment(data);
+        updateConversation(conversationId, (conversation) => {
+          const exists = conversation.attachments.some(
+            (item) => item.id === attachment.id
+          );
+          const attachments = exists
+            ? conversation.attachments
+            : [attachment, ...conversation.attachments];
+          return {
+            ...conversation,
+            attachments,
+            lastUpdatedAt: new Date().toISOString()
+          };
+        });
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 400) {
+          showToast(error.message || "Attachment limit reached.");
+        } else {
+          showToast("Unable to upload attachment.");
+        }
+        console.error(error);
+      }
+    });
+
+    await Promise.all(uploads);
   };
+
+  const handleSendMessageNonStreaming = React.useCallback(
+    async (conversationId: string, content: string, shouldUseDocs: boolean) => {
+      try {
+        const response = await postJson<{
+          messages: BackendMessage[];
+          warning?: string;
+        }>(`/conversations/${conversationId}/messages`, {
+          content,
+          useDocs: shouldUseDocs
+        });
+
+        updateConversation(conversationId, (conversation) => ({
+          ...conversation,
+          messages: [
+            ...conversation.messages,
+            ...response.messages.map(normalizeMessage)
+          ],
+          lastUpdatedAt: new Date().toISOString()
+        }));
+
+        if (response.warning) {
+          showToast(response.warning);
+        }
+      } catch (error) {
+        reportApiError(
+          `POST /conversations/${conversationId}/messages`,
+          error
+        );
+        throw error;
+      }
+    },
+    [reportApiError, showToast, updateConversation]
+  );
 
   const handleSendMessage = async (content: string, shouldUseDocs: boolean) => {
     if (!activeConversation) return;
     const trimmed = content.trim();
     if (!trimmed) return;
-    const model = selectedModel;
 
     const conversationId = activeConversation.id;
-    const now = Date.now();
-    const userMessage: Message = {
-      id: createId(),
-      role: "user",
-      content: trimmed,
-      useDocs: shouldUseDocs
-    };
-    const assistantMessage: Message = {
-      id: createId(),
-      role: "assistant",
-      content: "",
-      isStreaming: true
-    };
-
+    const previousMessageCount = activeConversation.messages.length;
     updateConversation(conversationId, (conversation) => ({
       ...conversation,
-      messages: [...conversation.messages, userMessage, assistantMessage],
-      lastUpdatedAt: now
+      lastUpdatedAt: new Date().toISOString()
     }));
 
-    for await (const chunk of mockStreamAssistantReply(trimmed, shouldUseDocs, model)) {
-      updateConversation(conversationId, (conversation) => ({
-        ...conversation,
-        messages: conversation.messages.map((message) =>
-          message.id === assistantMessage.id
-            ? { ...message, content: `${message.content}${chunk}` }
-            : message
-        )
-      }));
+    if (!streamingEnabled) {
+      try {
+        await handleSendMessageNonStreaming(
+          conversationId,
+          trimmed,
+          shouldUseDocs
+        );
+      } catch (error) {
+        showToast("Unable to send message.");
+        console.error(error);
+      }
+      return;
     }
 
-    updateConversation(conversationId, (conversation) => ({
-      ...conversation,
-      messages: conversation.messages.map((message) =>
-        message.id === assistantMessage.id
-          ? { ...message, isStreaming: false }
-          : message
-      )
+    setStreamingByConversation((prev) => ({
+      ...prev,
+      [conversationId]: { content: "" }
     }));
+
+    const stream = streamSSE<{ delta?: string; message?: string } | BackendMessage>(
+      `/conversations/${conversationId}/messages:stream`,
+      { content: trimmed, useDocs: shouldUseDocs }
+    );
+
+    let hadStreamError = false;
+    let finalReceived = false;
+
+    try {
+      await loadMessages(conversationId);
+      for await (const event of stream) {
+        if (event.event === "message.delta" && "delta" in event.data) {
+          const delta = event.data.delta ?? "";
+          setStreamingByConversation((prev) => {
+            const current = prev[conversationId] ?? { content: "" };
+            return {
+              ...prev,
+              [conversationId]: { content: `${current.content}${delta}` }
+            };
+          });
+        }
+        if (event.event === "message.final") {
+          const finalPayload = event.data as BackendMessage & { warning?: string };
+          const finalMessage = normalizeMessage(finalPayload);
+          updateConversation(conversationId, (conversation) => ({
+            ...conversation,
+            messages: [...conversation.messages, finalMessage]
+          }));
+          if (finalPayload.warning) {
+            showToast(finalPayload.warning);
+          }
+          setStreamingByConversation((prev) => {
+            const next = { ...prev };
+            delete next[conversationId];
+            return next;
+          });
+          finalReceived = true;
+        }
+        if (event.event === "error") {
+          hadStreamError = true;
+          const message =
+            typeof (event.data as { message?: string })?.message === "string"
+              ? (event.data as { message: string }).message
+              : "Streaming error.";
+          throw new Error(message);
+        }
+      }
+    } catch (error) {
+      hadStreamError = true;
+      setStreamingByConversation((prev) => {
+        const next = { ...prev };
+        delete next[conversationId];
+        return next;
+      });
+      showToast("Streaming failed.");
+      console.error(error);
+    }
+
+    if (!finalReceived) {
+      setStreamingByConversation((prev) => {
+        const next = { ...prev };
+        delete next[conversationId];
+        return next;
+      });
+    }
+
+    if (hadStreamError) {
+      try {
+        const latest = await getJson<BackendMessage[]>(
+          `/conversations/${conversationId}/messages`
+        );
+        updateConversation(conversationId, (conversation) => ({
+          ...conversation,
+          messages: latest.map(normalizeMessage)
+        }));
+        if (latest.length <= previousMessageCount) {
+          await handleSendMessageNonStreaming(
+            conversationId,
+            trimmed,
+            shouldUseDocs
+          );
+        }
+      } catch (error) {
+        showToast("Unable to send message.");
+        console.error(error);
+      }
+    } else {
+      await loadMessages(conversationId);
+    }
   };
 
   const handleSelectConversation = (id: string) => {
     setActiveId(id);
+    setSelectedAttachment(null);
     setIsSidebarOpen(false);
   };
 
-  const handleTogglePin = (id: string) => {
+  const handleTogglePin = async (id: string) => {
     const conversation = conversations.find((item) => item.id === id);
     if (!conversation) return;
+    const nextPinned = !conversation.isPinned;
+    const previous = conversation;
 
-    if (conversation.isPinned) {
-      setPinnedOrder((prev) => prev.filter((item) => item !== id));
-      updateConversation(id, (current) => ({
-        ...current,
-        isPinned: false,
-        pinnedAt: null,
-        lastUpdatedAt: Date.now()
-      }));
-      return;
-    }
-
-    const pinnedCount = conversations.filter((item) => item.isPinned).length;
-    if (pinnedCount >= 5) {
-      showToast("Max 5 pinned conversations");
-      return;
-    }
-
-    const now = Date.now();
-    setPinnedOrder((prev) => [id, ...prev.filter((item) => item !== id)]);
     updateConversation(id, (current) => ({
       ...current,
-      isPinned: true,
-      pinnedAt: now,
-      lastUpdatedAt: now
+      isPinned: nextPinned,
+      pinnedAt: nextPinned ? new Date().toISOString() : null
     }));
-  };
 
-  const handleReorderPinned = (ids: string[]) => {
-    setPinnedOrder(ids);
-  };
-
-  const handleDeleteConversation = (id: string) => {
-    const nextPinnedOrder = pinnedOrder.filter((item) => item !== id);
-    setPinnedOrder(nextPinnedOrder);
-    setConversations((prev) => {
-      const nextConversations = prev.filter(
-        (conversation) => conversation.id !== id
+    try {
+      const data = await patchJson<BackendConversation>(`/conversations/${id}`,
+        { isPinned: nextPinned }
       );
-      if (activeId === id) {
-        if (nextConversations.length === 0) {
-          const freshConversation = createConversation();
-          setActiveId(freshConversation.id);
-          return [freshConversation];
-        }
-
-        const nextSorted = [
-          ...sortPinnedConversations(nextConversations, nextPinnedOrder),
-          ...sortUnpinnedConversations(nextConversations)
-        ];
-        setActiveId(nextSorted[0].id);
+      updateConversation(id, (current) =>
+        normalizeConversation(data, current)
+      );
+    } catch (error) {
+      updateConversation(id, () => previous);
+      if (error instanceof ApiError && error.status === 400) {
+        showToast("Max 5 pinned conversations");
+      } else {
+        showToast("Unable to update pin.");
       }
-      return nextConversations;
-    });
+      console.error(error);
+    }
+  };
+
+  const handleReorderPinned = async (ids: string[]) => {
+    const previous = conversations;
+    setConversations((prev) =>
+      prev.map((conversation) => {
+        const index = ids.indexOf(conversation.id);
+        if (index === -1) {
+          return conversation.isPinned
+            ? { ...conversation, pinnedOrder: null }
+            : conversation;
+        }
+        return {
+          ...conversation,
+          isPinned: true,
+          pinnedOrder: index + 1
+        };
+      })
+    );
+
+    try {
+      await putJson<{ status: string }>("/conversations/pinned-order", {
+        ids
+      });
+    } catch (error) {
+      setConversations(previous);
+      showToast("Unable to reorder pinned conversations.");
+      console.error(error);
+    }
+  };
+
+  const handleDeleteConversation = async (id: string) => {
+    try {
+      await deleteJson<{ status: string }>(`/conversations/${id}`);
+    } catch (error) {
+      showToast("Unable to delete conversation.");
+      console.error(error);
+      return;
+    }
+
+    setConversations((prev) => prev.filter((conversation) => conversation.id !== id));
+
+    if (activeId === id) {
+      const remaining = conversations.filter((conversation) => conversation.id !== id);
+      if (remaining.length === 0) {
+        await handleNewChat();
+        return;
+      }
+      const nextSorted = [
+        ...sortPinnedConversations(remaining),
+        ...sortUnpinnedConversations(remaining)
+      ];
+      setActiveId(nextSorted[0].id);
+    }
   };
 
   const handleOpenAttachment = (attachment: Attachment) => {
@@ -379,8 +613,14 @@ export default function ChatApp() {
     setIsSidebarOpen(false);
   };
 
+  const useDocsEnabled = (activeConversation?.attachments.length ?? 0) > 0;
+  const resolvedUseDocs = activeConversation
+    ? useDocsByConversation[activeConversation.id] ??
+      (useDocsEnabled ? useDocsDefaults : false)
+    : false;
+
   const isStreaming = Boolean(
-    activeConversation?.messages.some((message) => message.isStreaming)
+    activeConversation && streamingByConversation[activeConversation.id]
   );
   const isViewerOpen = Boolean(selectedAttachment);
   const viewerVariant = isWideLayout ? "sidebar" : "overlay";
@@ -415,31 +655,6 @@ export default function ChatApp() {
 
   React.useEffect(() => {
     if (!mounted) return;
-    const stored = window.localStorage.getItem("pinnedOrder");
-    if (stored) {
-      try {
-        const parsed = JSON.parse(stored);
-        if (Array.isArray(parsed)) {
-          setPinnedOrder(parsed.filter((item) => typeof item === "string"));
-        }
-      } catch (error) {
-        console.error("Failed to parse pinned order", error);
-      }
-    }
-  }, [mounted]);
-
-  React.useEffect(() => {
-    if (!mounted) return;
-    const stored = window.localStorage.getItem("useDocsPreference");
-    if (stored === "true") {
-      setUseDocs(true);
-    } else if (stored === "false") {
-      setUseDocs(false);
-    }
-  }, [mounted]);
-
-  React.useEffect(() => {
-    if (!mounted) return;
     const mediaQuery = window.matchMedia("(min-width: 900px)");
     const updateLayout = () => setIsWideLayout(mediaQuery.matches);
     updateLayout();
@@ -447,7 +662,7 @@ export default function ChatApp() {
     return () => {
       mediaQuery.removeEventListener("change", updateLayout);
     };
-  }, []);
+  }, [mounted]);
 
   React.useEffect(() => {
     if (!mounted) return;
@@ -467,36 +682,106 @@ export default function ChatApp() {
 
   React.useEffect(() => {
     if (!mounted) return;
-    window.localStorage.setItem("pinnedOrder", JSON.stringify(pinnedOrder));
-  }, [pinnedOrder, mounted]);
-
-  React.useEffect(() => {
-    if (!mounted) return;
-    window.localStorage.setItem("useDocsPreference", useDocs ? "true" : "false");
-  }, [useDocs, mounted]);
-
-  React.useEffect(() => {
-    if (!mounted) return;
     window.localStorage.setItem("preferredModel", selectedModel);
   }, [selectedModel, mounted]);
 
   React.useEffect(() => {
-    setPinnedOrder((prev) => {
-      const pinnedIds = conversations
-        .filter((conversation) => conversation.isPinned)
-        .map((conversation) => conversation.id);
-      const filtered = prev.filter((id) => pinnedIds.includes(id));
-      const missing = pinnedIds.filter((id) => !filtered.includes(id));
-      if (missing.length === 0 && filtered.length === prev.length) {
-        return prev;
+    if (!mounted) return;
+    let isActive = true;
+    const load = async () => {
+      try {
+        const settings = await getJson<{ theme: Theme | null; useDocs: boolean }>(
+          "/settings"
+        );
+        if (!isActive) return;
+        if (settings.theme === "light" || settings.theme === "dark") {
+          setTheme(settings.theme);
+        }
+        setUseDocsDefaults(Boolean(settings.useDocs));
+      } catch (error) {
+        console.error(error);
       }
-      return [...filtered, ...missing];
-    });
-  }, [conversations]);
 
-  const handleThemeSelect = (value: Theme) => {
+      try {
+        const data = await refreshConversations();
+        if (!isActive) return;
+        if (data.length === 0) {
+          await handleNewChat();
+        }
+      } catch (error) {
+        showToast("Unable to load conversations.");
+        console.error(error);
+        try {
+          await handleNewChat();
+        } catch (fallbackError) {
+          console.error(fallbackError);
+        }
+      }
+    };
+
+    load();
+
+    return () => {
+      isActive = false;
+    };
+  }, [mounted, refreshConversations, setTheme, showToast]);
+
+  React.useEffect(() => {
+    if (!activeId) return;
+    let isActive = true;
+    const load = async () => {
+      try {
+        await Promise.all([loadMessages(activeId), loadAttachments(activeId)]);
+      } catch (error) {
+        if (isActive) {
+          showToast("Unable to load conversation details.");
+        }
+        console.error(error);
+      }
+    };
+
+    load();
+
+    return () => {
+      isActive = false;
+    };
+  }, [activeId, loadAttachments, loadMessages, showToast]);
+
+  React.useEffect(() => {
+    if (!activeConversation) return;
+    const id = activeConversation.id;
+    const count = activeConversation.attachments.length;
+    const previous = attachmentCountRef.current[id];
+    attachmentCountRef.current[id] = count;
+
+    setUseDocsByConversation((prev) => {
+      const current = prev[id];
+      if (count === 0) {
+        if (current === false) return prev;
+        return { ...prev, [id]: false };
+      }
+      if (previous === undefined) {
+        if (current !== undefined) return prev;
+        return { ...prev, [id]: useDocsDefaults };
+      }
+      if (previous === 0 && count > 0) {
+        if (current === true) return prev;
+        return { ...prev, [id]: true };
+      }
+      return prev;
+    });
+  }, [activeConversation, useDocsDefaults]);
+
+  const handleThemeSelect = async (value: Theme) => {
     setTheme(value);
     setIsSettingsOpen(false);
+    try {
+      await patchJson<{ theme: Theme | null; useDocs: boolean }>("/settings", {
+        theme: value
+      });
+    } catch (error) {
+      console.error(error);
+    }
   };
 
   return (
@@ -508,12 +793,17 @@ export default function ChatApp() {
           </div>
         </div>
       ) : null}
+      {process.env.NODE_ENV !== "production" && lastApiError ? (
+        <div className="pointer-events-none fixed left-4 top-4 z-[98] max-w-lg rounded-2xl border border-border bg-card/90 px-4 py-3 text-xs text-ink shadow-soft">
+          API: {lastApiError}
+        </div>
+      ) : null}
       {!isViewerOpen ? (
         <div className="hidden md:flex">
           <Sidebar
             pinnedConversations={pinnedConversations}
             conversations={unpinnedConversations}
-            activeId={activeId}
+            activeId={activeId ?? ""}
             attachments={activeConversation?.attachments ?? []}
             selectedModel={selectedModel}
             onNewChat={handleNewChat}
@@ -538,7 +828,7 @@ export default function ChatApp() {
             <Sidebar
               pinnedConversations={pinnedConversations}
               conversations={unpinnedConversations}
-              activeId={activeId}
+              activeId={activeId ?? ""}
               attachments={activeConversation?.attachments ?? []}
               selectedModel={selectedModel}
               onNewChat={handleNewChat}
@@ -637,14 +927,32 @@ export default function ChatApp() {
             ) : null}
           </div>
         </header>
-        <ChatThread messages={activeConversation?.messages ?? []} />
+        <ChatThread
+          messages={activeConversation?.messages ?? []}
+          streamingMessage={
+            activeConversation && streamingByConversation[activeConversation.id]
+              ? {
+                  role: "assistant",
+                  content: streamingByConversation[activeConversation.id].content,
+                  isStreaming: true
+                }
+              : null
+          }
+        />
         <Composer
           disabled={!activeConversation}
           isStreaming={isStreaming}
           onAttachFiles={handleAttachFiles}
           onSendMessage={handleSendMessage}
-          useDocs={useDocs}
-          onToggleUseDocs={setUseDocs}
+          useDocs={resolvedUseDocs}
+          onToggleUseDocs={(value) => {
+            if (!activeConversation || !useDocsEnabled) return;
+            setUseDocsByConversation((prev) => ({
+              ...prev,
+              [activeConversation.id]: value
+            }));
+          }}
+          useDocsEnabled={useDocsEnabled}
         />
       </div>
       {selectedAttachment ? (

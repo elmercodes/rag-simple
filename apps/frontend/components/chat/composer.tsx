@@ -13,6 +13,7 @@ type ComposerProps = {
   onAttachFiles: (files: FileList) => void;
   useDocs: boolean;
   onToggleUseDocs: (value: boolean) => void;
+  useDocsEnabled?: boolean;
 };
 
 export default function Composer({
@@ -21,7 +22,8 @@ export default function Composer({
   onSendMessage,
   onAttachFiles,
   useDocs,
-  onToggleUseDocs
+  onToggleUseDocs,
+  useDocsEnabled = true
 }: ComposerProps) {
   const [value, setValue] = React.useState("");
   const fileInputRef = React.useRef<HTMLInputElement>(null);
@@ -80,16 +82,21 @@ export default function Composer({
             <button
               type="button"
               aria-pressed={useDocs}
-              onClick={() => onToggleUseDocs(!useDocs)}
+              onClick={() => {
+                if (!useDocsEnabled) return;
+                onToggleUseDocs(!useDocs);
+              }}
               className={cn(
                 "relative h-6 w-12 overflow-hidden rounded-full border px-1 transition",
                 useDocs
                   ? "border-accent-strong bg-ink/70 text-ink shadow-glow"
-                  : "border-border bg-card/90 hover:border-accent"
+                  : "border-border bg-card/90 hover:border-accent",
+                !useDocsEnabled ? "cursor-not-allowed opacity-50" : ""
               )}
               aria-label="Toggle use documents"
               role="switch"
               aria-checked={useDocs}
+              aria-disabled={!useDocsEnabled}
             >
               <span
                 className={cn(
