@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Paperclip, SendHorizontal } from "lucide-react";
+import { Paperclip, SendHorizontal, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
@@ -14,6 +14,7 @@ type ComposerProps = {
   useDocs: boolean;
   onToggleUseDocs: (value: boolean) => void;
   useDocsEnabled?: boolean;
+  isUploadingAttachments?: boolean;
 };
 
 export default function Composer({
@@ -23,7 +24,8 @@ export default function Composer({
   onAttachFiles,
   useDocs,
   onToggleUseDocs,
-  useDocsEnabled = true
+  useDocsEnabled = true,
+  isUploadingAttachments = false
 }: ComposerProps) {
   const [value, setValue] = React.useState("");
   const fileInputRef = React.useRef<HTMLInputElement>(null);
@@ -55,7 +57,7 @@ export default function Composer({
           type="button"
           className="flex h-11 w-11 items-center justify-center rounded-2xl border border-border bg-card/90 text-ink shadow-glow transition hover:bg-accent/40"
           onClick={() => fileInputRef.current?.click()}
-          disabled={disabled}
+          disabled={disabled || isUploadingAttachments}
           aria-label="Attach files"
         >
           <Paperclip className="h-5 w-5" />
@@ -126,6 +128,12 @@ export default function Composer({
       <div className="mt-2 text-xs text-muted">
         Enter to send, Shift + Enter for newline.
       </div>
+      {isUploadingAttachments ? (
+        <div className="mt-2 flex items-center gap-2 text-xs text-muted">
+          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          Uploading / indexing attachments...
+        </div>
+      ) : null}
     </div>
   );
 }

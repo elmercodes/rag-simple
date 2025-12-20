@@ -150,6 +150,9 @@ export default function ChatApp() {
   const toastTimeoutRef = React.useRef<ReturnType<typeof setTimeout> | null>(
     null
   );
+  const apiErrorTimeoutRef = React.useRef<ReturnType<typeof setTimeout> | null>(
+    null
+  );
   const [toastMessage, setToastMessage] = React.useState<string | null>(null);
   const [lastApiError, setLastApiError] = React.useState<string | null>(null);
   const [initialLoadFailed, setInitialLoadFailed] = React.useState(false);
@@ -166,6 +169,9 @@ export default function ChatApp() {
   >({});
   const [streamingByConversation, setStreamingByConversation] = React.useState<
     Record<string, { content: string }>
+  >({});
+  const [uploadingByConversation, setUploadingByConversation] = React.useState<
+    Record<string, boolean>
   >({});
   const attachmentCountRef = React.useRef<Record<string, number>>({});
 
@@ -204,6 +210,16 @@ export default function ChatApp() {
 
   const reportApiError = React.useCallback((context: string, error: unknown) => {
     if (process.env.NODE_ENV === "production") return;
+    const setApiError = (message: string) => {
+      setLastApiError(message);
+      if (apiErrorTimeoutRef.current) {
+        clearTimeout(apiErrorTimeoutRef.current);
+      }
+      apiErrorTimeoutRef.current = setTimeout(() => {
+        setLastApiError(null);
+      }, 8000);
+    };
+
     if (error instanceof ApiError) {
       const detail =
         typeof error.details === "string"
@@ -214,13 +230,13 @@ export default function ChatApp() {
         message: error.message,
         detail
       });
-      setLastApiError(
+      setApiError(
         `${context}: ${error.status} ${error.message}${detail ? ` — ${detail}` : ""}`
       );
       return;
     }
     console.error(`[API] ${context}`, error);
-    setLastApiError(`${context}: ${String(error)}`);
+    setApiError(`${context}: ${String(error)}`);
   }, []);
 
   const syncConversations = React.useCallback(
@@ -347,6 +363,10 @@ export default function ChatApp() {
   const handleAttachFiles = async (files: FileList) => {
     if (!activeConversation || files.length === 0) return;
     const conversationId = activeConversation.id;
+    setUploadingByConversation((prev) => ({
+      ...prev,
+      [conversationId]: true
+    }));
 
     const uploads = Array.from(files).map(async (file) => {
       try {
@@ -378,7 +398,14 @@ export default function ChatApp() {
       }
     });
 
-    await Promise.all(uploads);
+    try {
+      await Promise.all(uploads);
+    } finally {
+      setUploadingByConversation((prev) => ({
+        ...prev,
+        [conversationId]: false
+      }));
+    }
   };
 
   const handleSendMessageNonStreaming = React.useCallback(
@@ -392,18 +419,10 @@ export default function ChatApp() {
           useDocs: shouldUseDocs
         });
 
-        updateConversation(conversationId, (conversation) => ({
-          ...conversation,
-          messages: [
-            ...conversation.messages,
-            ...response.messages.map(normalizeMessage)
-          ],
-          lastUpdatedAt: new Date().toISOString()
-        }));
-
         if (response.warning) {
           showToast(response.warning);
         }
+        return response.messages.map(normalizeMessage);
       } catch (error) {
         reportApiError(
           `POST /conversations/${conversationId}/messages`,
@@ -412,7 +431,7 @@ export default function ChatApp() {
         throw error;
       }
     },
-    [reportApiError, showToast, updateConversation]
+    [reportApiError, showToast]
   );
 
   const handleSendMessage = async (content: string, shouldUseDocs: boolean) => {
@@ -422,9 +441,22 @@ export default function ChatApp() {
 
     const conversationId = activeConversation.id;
     const previousMessageCount = activeConversation.messages.length;
+    const optimisticUserMessage: Message = {
+      id: `tmp-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`}`,
+      role: "user",
+      content: trimmed,
+      createdAt: new Date().toISOString()
+    };
+
     updateConversation(conversationId, (conversation) => ({
       ...conversation,
+      messages: [...conversation.messages, optimisticUserMessage],
       lastUpdatedAt: new Date().toISOString()
+    }));
+
+    setStreamingByConversation((prev) => ({
+      ...prev,
+      [conversationId]: { content: "" }
     }));
 
     if (!streamingEnabled) {
@@ -434,17 +466,19 @@ export default function ChatApp() {
           trimmed,
           shouldUseDocs
         );
+        await loadMessages(conversationId);
       } catch (error) {
         showToast("Unable to send message.");
         console.error(error);
+      } finally {
+        setStreamingByConversation((prev) => {
+          const next = { ...prev };
+          delete next[conversationId];
+          return next;
+        });
       }
       return;
     }
-
-    setStreamingByConversation((prev) => ({
-      ...prev,
-      [conversationId]: { content: "" }
-    }));
 
     const stream = streamSSE<{ delta?: string; message?: string } | BackendMessage>(
       `/conversations/${conversationId}/messages:stream`,
@@ -455,7 +489,6 @@ export default function ChatApp() {
     let finalReceived = false;
 
     try {
-      await loadMessages(conversationId);
       for await (const event of stream) {
         if (event.event === "message.delta" && "delta" in event.data) {
           const delta = event.data.delta ?? "";
@@ -527,6 +560,7 @@ export default function ChatApp() {
             trimmed,
             shouldUseDocs
           );
+          await loadMessages(conversationId);
         }
       } catch (error) {
         showToast("Unable to send message.");
@@ -701,6 +735,9 @@ export default function ChatApp() {
       if (toastTimeoutRef.current) {
         clearTimeout(toastTimeoutRef.current);
       }
+      if (apiErrorTimeoutRef.current) {
+        clearTimeout(apiErrorTimeoutRef.current);
+      }
     };
   }, []);
 
@@ -815,8 +852,23 @@ export default function ChatApp() {
         </div>
       ) : null}
       {process.env.NODE_ENV !== "production" && lastApiError ? (
-        <div className="pointer-events-none fixed left-4 top-4 z-[98] max-w-lg rounded-2xl border border-border bg-card/90 px-4 py-3 text-xs text-ink shadow-soft">
-          API: {lastApiError}
+        <div className="fixed left-4 top-4 z-[98] max-w-lg rounded-2xl border border-border bg-card/90 px-4 py-3 pr-10 text-xs text-ink shadow-soft">
+          <div className="flex items-start justify-between gap-4">
+            <span>API: {lastApiError}</span>
+            <button
+              type="button"
+              className="flex h-6 w-6 items-center justify-center rounded-full border border-border text-muted transition hover:bg-accent/40 hover:text-ink"
+              aria-label="Dismiss API error"
+              onClick={() => {
+                setLastApiError(null);
+                if (apiErrorTimeoutRef.current) {
+                  clearTimeout(apiErrorTimeoutRef.current);
+                }
+              }}
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
         </div>
       ) : null}
       {!isViewerOpen ? (
@@ -826,6 +878,11 @@ export default function ChatApp() {
             conversations={unpinnedConversations}
             activeId={activeId ?? ""}
             attachments={activeConversation?.attachments ?? []}
+            isUploadingAttachments={
+              activeConversation
+                ? Boolean(uploadingByConversation[activeConversation.id])
+                : false
+            }
             selectedModel={selectedModel}
             onNewChat={handleNewChat}
             onSelectConversation={handleSelectConversation}
@@ -851,6 +908,11 @@ export default function ChatApp() {
               conversations={unpinnedConversations}
               activeId={activeId ?? ""}
               attachments={activeConversation?.attachments ?? []}
+              isUploadingAttachments={
+                activeConversation
+                  ? Boolean(uploadingByConversation[activeConversation.id])
+                  : false
+              }
               selectedModel={selectedModel}
               onNewChat={handleNewChat}
               onSelectConversation={handleSelectConversation}
@@ -978,6 +1040,11 @@ export default function ChatApp() {
         <Composer
           disabled={!activeConversation}
           isStreaming={isStreaming}
+          isUploadingAttachments={
+            activeConversation
+              ? Boolean(uploadingByConversation[activeConversation.id])
+              : false
+          }
           onAttachFiles={handleAttachFiles}
           onSendMessage={handleSendMessage}
           useDocs={resolvedUseDocs}

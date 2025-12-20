@@ -24,7 +24,8 @@ import {
   Check,
   ChevronDown,
   Stethoscope,
-  Trash2
+  Trash2,
+  Loader2
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { badgeVariants } from "@/components/ui/badge";
@@ -47,6 +48,7 @@ type SidebarProps = {
   conversations: Conversation[];
   activeId: string;
   attachments: Attachment[];
+  isUploadingAttachments?: boolean;
   selectedModel: AIModel;
   onNewChat: () => void;
   onSelectConversation: (id: string) => void;
@@ -62,6 +64,7 @@ export default function Sidebar({
   conversations,
   activeId,
   attachments,
+  isUploadingAttachments = false,
   selectedModel,
   onNewChat,
   onSelectConversation,
@@ -265,6 +268,12 @@ export default function Sidebar({
             ))
           )}
         </div>
+        {isUploadingAttachments ? (
+          <div className="mt-2 flex items-center gap-2 text-xs text-muted">
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            Uploading / indexing...
+          </div>
+        ) : null}
       </div>
 
       <div className="px-5 pb-4">
