@@ -25,7 +25,8 @@ import {
   ChevronDown,
   Stethoscope,
   Trash2,
-  Loader2
+  Loader2,
+  X
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { badgeVariants } from "@/components/ui/badge";
@@ -53,6 +54,7 @@ type SidebarProps = {
   onNewChat: () => void;
   onSelectConversation: (id: string) => void;
   onSelectAttachment: (attachment: Attachment) => void;
+  onDeleteAttachment: (attachment: Attachment) => void;
   onTogglePin: (id: string) => void;
   onDeleteConversation: (id: string) => void;
   onReorderPinned: (ids: string[]) => void;
@@ -69,6 +71,7 @@ export default function Sidebar({
   onNewChat,
   onSelectConversation,
   onSelectAttachment,
+  onDeleteAttachment,
   onTogglePin,
   onDeleteConversation,
   onReorderPinned,
@@ -92,8 +95,6 @@ export default function Sidebar({
     conversation: Conversation,
     sortable?: ReturnType<typeof useSortable>
   ) => {
-    const lastMessage =
-      conversation.messages[conversation.messages.length - 1];
     const isActive = conversation.id === activeId;
     const draggableStyle =
       sortable && (sortable.transform || sortable.transition)
@@ -143,14 +144,6 @@ export default function Sidebar({
               )}
             >
               {conversation.title}
-            </div>
-            <div
-              className={cn(
-                "mt-1 text-xs",
-                isActive ? "text-active-text/80" : "text-muted"
-              )}
-            >
-              {lastMessage?.content ?? "No messages yet."}
             </div>
           </div>
           <DropdownMenu>
@@ -254,17 +247,33 @@ export default function Sidebar({
             </div>
           ) : (
             attachments.map((attachment) => (
-              <button
+              <div
                 key={attachment.id}
-                type="button"
-                onClick={() => onSelectAttachment(attachment)}
                 className={cn(
                   badgeVariants(),
-                  "shrink-0 cursor-pointer transition hover:border-accent hover:bg-accent/60 hover:text-ink"
+                  "flex shrink-0 items-center gap-1 pr-1 transition hover:border-accent hover:bg-accent/60 hover:text-ink"
                 )}
               >
-                {attachment.name}
-              </button>
+                <button
+                  type="button"
+                  onClick={() => onSelectAttachment(attachment)}
+                  className="max-w-[140px] truncate text-left"
+                >
+                  {attachment.name}
+                </button>
+                <button
+                  type="button"
+                  className="rounded-full p-0.5 text-muted transition hover:text-ink"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onDeleteAttachment(attachment);
+                  }}
+                  aria-label={`Delete ${attachment.name}`}
+                  title="Delete attachment"
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              </div>
             ))
           )}
         </div>

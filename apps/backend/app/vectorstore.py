@@ -679,3 +679,26 @@ def delete_conversation_embeddings(conversation_id: int, user_id: int) -> None:
         except Exception:
             # Best-effort cleanup; ignore collection-specific failures.
             continue
+
+
+def delete_attachment_embeddings(
+    conversation_id: int,
+    user_id: int,
+    attachment_id: int,
+) -> None:
+    """
+    Remove vector entries for a single attachment across known collections.
+    """
+    collections = {ACTIVE_COLLECTION_NAME, LEGACY_COLLECTION_NAME}
+    for name in collections:
+        collection = _get_collection(name)
+        try:
+            collection.delete(
+                where=_scoped_where(
+                    conversation_id,
+                    user_id,
+                    extra={"attachment_id": attachment_id},
+                )
+            )
+        except Exception:
+            continue

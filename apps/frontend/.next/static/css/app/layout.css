@@ -1359,6 +1359,9 @@ video {
 .min-w-\[220px\] {
   min-width: 220px;
 }
+.max-w-\[140px\] {
+  max-width: 140px;
+}
 .max-w-\[320px\] {
   max-width: 320px;
 }
@@ -1428,9 +1431,6 @@ video {
 }
 .cursor-not-allowed {
   cursor: not-allowed;
-}
-.cursor-pointer {
-  cursor: pointer;
 }
 .touch-none {
   touch-action: none;
@@ -1772,6 +1772,9 @@ video {
 .pl-8 {
   padding-left: 2rem;
 }
+.pr-1 {
+  padding-right: 0.25rem;
+}
 .pr-10 {
   padding-right: 2.5rem;
 }
@@ -1842,9 +1845,6 @@ video {
 .text-active-text {
   --tw-text-opacity: 1;
   color: rgb(var(--color-active-text) / var(--tw-text-opacity, 1));
-}
-.text-active-text\/80 {
-  color: rgb(var(--color-active-text) / 0.8);
 }
 .text-chip-text {
   --tw-text-opacity: 1;

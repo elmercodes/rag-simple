@@ -82,6 +82,7 @@ type BackendMessage = {
     verdict?: "SUPPORTED" | "PARTIAL" | "UNSUPPORTED" | string | null;
     confidence?: number | null;
     warning?: string | null;
+    latencySeconds?: number | null;
   };
   warning?: string;
 };
@@ -95,6 +96,14 @@ type BackendAttachment = {
 
 const timestamp = (value?: string | null) =>
   value ? Date.parse(value) : 0;
+
+const truncateTitle = (value: string, maxLen: number = 30) => {
+  const normalized = value.trim().replace(/\s+/g, " ");
+  if (!normalized) return "";
+  if (normalized.length <= maxLen) return normalized;
+  if (maxLen <= 3) return normalized.slice(0, maxLen);
+  return `${normalized.slice(0, maxLen - 3).trimEnd()}...`;
+};
 
 const normalizeConversation = (
   payload: BackendConversation,
@@ -466,6 +475,11 @@ export default function ChatApp() {
 
     const conversationId = activeConversation.id;
     const previousMessageCount = activeConversation.messages.length;
+    const autoTitle =
+      previousMessageCount === 0 &&
+      activeConversation.title.startsWith("New chat ")
+        ? truncateTitle(trimmed, 30)
+        : "";
     const optimisticUserMessage: Message = {
       id: `tmp-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`}`,
       role: "user",
@@ -476,7 +490,8 @@ export default function ChatApp() {
     updateConversation(conversationId, (conversation) => ({
       ...conversation,
       messages: [...conversation.messages, optimisticUserMessage],
-      lastUpdatedAt: new Date().toISOString()
+      lastUpdatedAt: new Date().toISOString(),
+      title: autoTitle || conversation.title
     }));
 
     setStreamingByConversation((prev) => ({
@@ -552,6 +567,16 @@ export default function ChatApp() {
             };
           });
         }
+        if (event.event === "message.cancelled") {
+          setStreamingByConversation((prev) => {
+            const next = { ...prev };
+            delete next[conversationId];
+            return next;
+          });
+          finalReceived = true;
+          wasAborted = true;
+          break;
+        }
         if (event.event === "message.final") {
           const finalPayload = event.data as BackendMessage & { warning?: string };
           const finalMessage = normalizeMessage(finalPayload);
@@ -606,6 +631,7 @@ export default function ChatApp() {
     delete abortRequestedRef.current[conversationId];
 
     if (wasAborted) {
+      await loadMessages(conversationId);
       return;
     }
 
@@ -635,25 +661,18 @@ export default function ChatApp() {
     }
   };
 
-  const handleStopStreaming = React.useCallback(() => {
+  const handleStopStreaming = React.useCallback(async () => {
     if (!activeConversation) return;
     const conversationId = activeConversation.id;
     abortRequestedRef.current[conversationId] = true;
 
-    const partial = streamingByConversation[conversationId]?.content ?? "";
-    if (partial.trim()) {
-      updateConversation(conversationId, (conversation) => ({
-        ...conversation,
-        messages: [
-          ...conversation.messages,
-          {
-            id: `tmp-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`}`,
-            role: "assistant",
-            content: partial,
-            createdAt: new Date().toISOString()
-          }
-        ]
-      }));
+    try {
+      await postJson(`/conversations/${conversationId}/messages:cancel`, {});
+    } catch (error) {
+      reportApiError(
+        `POST /conversations/${conversationId}/messages:cancel`,
+        error
+      );
     }
 
     const controller = abortControllersRef.current[conversationId];
@@ -667,7 +686,33 @@ export default function ChatApp() {
       delete next[conversationId];
       return next;
     });
-  }, [activeConversation, streamingByConversation, updateConversation]);
+  }, [activeConversation, reportApiError]);
+
+  const handleDeleteAttachment = React.useCallback(
+    async (attachment: Attachment) => {
+      if (!activeConversation) return;
+      const confirmed = window.confirm(
+        `Delete ${attachment.name}? This removes it from this chat.`
+      );
+      if (!confirmed) return;
+      try {
+        await deleteJson(`/attachments/${attachment.id}`);
+        updateConversation(activeConversation.id, (conversation) => ({
+          ...conversation,
+          attachments: conversation.attachments.filter(
+            (item) => item.id !== attachment.id
+          )
+        }));
+        if (selectedAttachment?.id === attachment.id) {
+          setSelectedAttachment(null);
+        }
+      } catch (error) {
+        showToast("Unable to delete document.");
+        console.error(error);
+      }
+    },
+    [activeConversation, selectedAttachment, showToast, updateConversation]
+  );
 
   const handleSelectConversation = (id: string) => {
     setActiveId(id);
@@ -725,7 +770,7 @@ export default function ChatApp() {
 
     try {
       await putJson<{ status: string }>("/conversations/pinned-order", {
-        ids
+        ids: ids.map((id) => Number(id))
       });
     } catch (error) {
       setConversations(previous);
@@ -985,6 +1030,7 @@ export default function ChatApp() {
             onNewChat={handleNewChat}
             onSelectConversation={handleSelectConversation}
             onSelectAttachment={handleOpenAttachment}
+            onDeleteAttachment={handleDeleteAttachment}
             onTogglePin={handleTogglePin}
             onDeleteConversation={handleDeleteConversation}
             onReorderPinned={handleReorderPinned}
@@ -1015,6 +1061,7 @@ export default function ChatApp() {
               onNewChat={handleNewChat}
               onSelectConversation={handleSelectConversation}
               onSelectAttachment={handleOpenAttachment}
+              onDeleteAttachment={handleDeleteAttachment}
               onTogglePin={handleTogglePin}
               onDeleteConversation={handleDeleteConversation}
               onReorderPinned={handleReorderPinned}

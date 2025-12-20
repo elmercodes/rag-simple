@@ -1,7 +1,9 @@
 import hashlib
 import json
 import os
+import time
 from datetime import datetime, timezone
+from threading import Lock
 from typing import Dict, List, Optional
 
 from fastapi import Body, Depends, FastAPI, File, HTTPException, UploadFile
@@ -19,6 +21,7 @@ from backend.app.retrieval_policy import classify_intent, preferred_sections, sh
 from backend.app.vectorstore import (
     build_context_and_sources,
     delete_conversation_embeddings,
+    delete_attachment_embeddings,
     ingest_file,
     retrieve_hits,
 )
@@ -53,6 +56,9 @@ RAW_DATA_DIR = os.path.join(PROJECT_ROOT, "data", "raw")
 os.makedirs(RAW_DATA_DIR, exist_ok=True)
 
 DEFAULT_USER_ID: Optional[int] = None
+
+CANCELLED_STREAMS: dict[int, bool] = {}
+CANCEL_LOCK = Lock()
 
 
 # ---- Helpers ----
@@ -107,6 +113,7 @@ def serialize_message(msg: Message) -> Dict:
             "verdict": meta.get("verdict"),
             "confidence": meta.get("confidence"),
             "warning": meta.get("warning"),
+            "latencySeconds": meta.get("latency_seconds"),
         },
     }
 
@@ -127,6 +134,57 @@ def chunk_text(text: str, size: int = 120) -> List[str]:
     if not text:
         return []
     return [text[i : i + size] for i in range(0, len(text), size)]
+
+
+def truncate_title(text: str, max_len: int = 30) -> str:
+    normalized = " ".join((text or "").strip().split())
+    if not normalized:
+        return ""
+    if len(normalized) <= max_len:
+        return normalized
+    if max_len <= 3:
+        return normalized[:max_len]
+    return normalized[: max_len - 3].rstrip() + "..."
+
+
+def maybe_rename_conversation_title(
+    db: Session, conversation: Conversation, content: str
+) -> None:
+    if not conversation.title or not conversation.title.startswith("New chat "):
+        return
+    user_count = (
+        db.query(func.count(Message.id))
+        .filter(
+            Message.conversation_id == conversation.id,
+            Message.role == "user",
+        )
+        .scalar()
+        or 0
+    )
+    if user_count != 1:
+        return
+    new_title = truncate_title(content, 30)
+    if not new_title:
+        return
+    conversation.title = new_title
+    conversation.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(conversation)
+
+
+def mark_cancelled(conversation_id: int):
+    with CANCEL_LOCK:
+        CANCELLED_STREAMS[conversation_id] = True
+
+
+def clear_cancelled(conversation_id: int):
+    with CANCEL_LOCK:
+        CANCELLED_STREAMS.pop(conversation_id, None)
+
+
+def is_cancelled(conversation_id: int) -> bool:
+    with CANCEL_LOCK:
+        return CANCELLED_STREAMS.get(conversation_id, False)
 
 
 def ensure_conversation(db: Session, conversation_id: int, user_id: int) -> Conversation:
@@ -316,8 +374,10 @@ def generate_answer(
 
     answer_system = (
         "You are a helpful assistant answering questions using the provided document excerpts.\n"
-        "Write one clear paragraph grounded in the excerpts.\n"
-        "If no relevant excerpts exist, say you cannot find a supported answer in the provided documents.\n\n"
+        "Write a natural, helpful answer grounded in the excerpts.\n"
+        "You may fill small gaps with reasonable assumptions that most readers would make, "
+        "but do NOT invent specific numbers, names, or claims not supported by the excerpts.\n"
+        "If the excerpts don't contain enough to answer, say you can't find a supported answer in the provided documents.\n\n"
         f"DOCUMENT EXCERPTS:\n{context}"
         if context
         else "You are a helpful assistant. No document excerpts were provided."
@@ -335,6 +395,7 @@ def generate_answer(
     )
     draft = resp.choices[0].message.content or ""
 
+    refusal = "I can’t find a supported answer in the provided document excerpts."
     final_answer, vdebug = verify_answer(
         chat_client=chat_client,
         model=model,
@@ -342,17 +403,48 @@ def generate_answer(
         draft=draft,
         context=context,
         evidence_hits=evidence_hits,
-        refusal_text="I can’t find a supported answer in the provided document excerpts.",
+        refusal_text=refusal,
     )
     verdict = (vdebug or {}).get("verdict", "UNSUPPORTED")
-    confidence = (vdebug or {}).get("confidence", 0.0)
-    if context and verdict == "UNSUPPORTED":
-        verdict = "PARTIAL"
-        final_answer = draft
-        confidence = min(float(confidence or 0.0), 0.55)
+    confidence = float((vdebug or {}).get("confidence", 0.0) or 0.0)
+
+    if verdict == "UNSUPPORTED":
+        retry_system = (
+            "You are answering using document excerpts.\n"
+            "Rewrite the answer so every key claim is directly supported or clearly deducible from the excerpts.\n"
+            "If not possible, reply exactly with:\n"
+            f"{refusal}\n\n"
+            f"DOCUMENT EXCERPTS:\n{context}"
+        )
+        retry_messages = [
+            {"role": "system", "content": retry_system},
+            {"role": "user", "content": user_message},
+        ]
+        retry_resp = chat_client.chat_complete(
+            model=model,
+            messages=retry_messages,
+            stream=False,
+        )
+        retry_draft = retry_resp.choices[0].message.content or ""
+
+        final_answer, vdebug = verify_answer(
+            chat_client=chat_client,
+            model=model,
+            question=user_message,
+            draft=retry_draft,
+            context=context,
+            evidence_hits=evidence_hits,
+            refusal_text=refusal,
+        )
+        verdict = (vdebug or {}).get("verdict", "UNSUPPORTED")
+        confidence = float((vdebug or {}).get("confidence", 0.0) or 0.0)
 
     citations = build_citations(evidence_hits, verdict)
     evidence = build_evidence(evidence_hits, verdict)
+    sources_field = sources if verdict != "UNSUPPORTED" else []
+    if verdict == "UNSUPPORTED":
+        citations = []
+        evidence = []
     meta = {
         "use_docs": True,
         "citations": citations,
@@ -361,7 +453,7 @@ def generate_answer(
         "verdict": verdict,
         "confidence": confidence,
         "warning": warning,
-        "sources": sources,
+        "sources": sources_field,
     }
     routing_reason = "RAG enabled with document retrieval."
     return final_answer, meta, routing_reason
@@ -422,17 +514,19 @@ def list_conversations(db: Session = Depends(get_db)):
 @app.post("/conversations")
 def create_conversation(db: Session = Depends(get_db)):
     user_id = current_user_id()
-    title = f"Session {datetime.utcnow().isoformat(timespec='minutes')}"
 
     settings = db.query(UserSettings).filter(UserSettings.user_id == user_id).first()
     use_docs_default = True if settings is None else bool(settings.use_docs_default)
 
     conv = Conversation(
         user_id=user_id,
-        title=title,
+        title="New chat",
         use_docs_default=use_docs_default,
     )
     db.add(conv)
+    db.commit()
+    db.refresh(conv)
+    conv.title = f"New chat {conv.id}"
     db.commit()
     db.refresh(conv)
     return serialize_conversation(conv)
@@ -532,9 +626,14 @@ def delete_conversation(conversation_id: int, db: Session = Depends(get_db)):
 @app.put("/conversations/pinned-order")
 def update_pinned_order(payload: Dict = Body(...), db: Session = Depends(get_db)):
     user_id = current_user_id()
-    order = payload.get("ids") or payload.get("conversationIds")
-    if not isinstance(order, list):
+    raw_order = payload.get("ids") or payload.get("conversationIds")
+    if not isinstance(raw_order, list) or not raw_order:
         raise HTTPException(status_code=400, detail="Body must include ordered list of pinned conversation IDs.")
+
+    try:
+        order = [int(x) for x in raw_order]
+    except Exception:
+        raise HTTPException(status_code=400, detail="Pinned conversation IDs must be integers.")
 
     pinned_convs = (
         db.query(Conversation)
@@ -588,14 +687,18 @@ def create_message(
         raise HTTPException(status_code=400, detail="Message content is required.")
 
     user_msg = add_message(db, conv, "user", content)
+    maybe_rename_conversation_title(db, conv, content)
 
     try:
+        start = time.perf_counter()
         answer, meta, reason = generate_answer(
             db=db,
             conversation=conv,
             user_message=content,
             use_docs_requested=use_docs,
         )
+        elapsed = time.perf_counter() - start
+        meta["latency_seconds"] = round(elapsed, 3)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -617,6 +720,14 @@ def create_message(
     return response
 
 
+@app.post("/conversations/{conversation_id}/messages:cancel")
+def cancel_stream(conversation_id: int, db: Session = Depends(get_db)):
+    user_id = current_user_id()
+    ensure_conversation(db, conversation_id, user_id)
+    mark_cancelled(conversation_id)
+    return {"status": "cancelled"}
+
+
 @app.post("/conversations/{conversation_id}/messages:stream")
 async def stream_message(
     conversation_id: int,
@@ -631,16 +742,31 @@ async def stream_message(
         raise HTTPException(status_code=400, detail="Message content is required.")
 
     user_msg = add_message(db, conv, "user", content)
+    maybe_rename_conversation_title(db, conv, content)
 
     def event_builder():
         try:
+            clear_cancelled(conversation_id)
             yield f"event: message.status\ndata: {json.dumps({'status': 'thinking'})}\n\n"
+            start = time.perf_counter()
             answer, meta, reason = generate_answer(
                 db=db,
                 conversation=conv,
                 user_message=content,
                 use_docs_requested=use_docs,
             )
+            elapsed = time.perf_counter() - start
+            meta["latency_seconds"] = round(elapsed, 3)
+            if is_cancelled(conversation_id):
+                yield f"event: message.cancelled\ndata: {json.dumps({'status': 'cancelled'})}\n\n"
+                return
+
+            for delta in chunk_text(answer):
+                if is_cancelled(conversation_id):
+                    yield f"event: message.cancelled\ndata: {json.dumps({'status': 'cancelled'})}\n\n"
+                    return
+                yield f"event: message.delta\ndata: {json.dumps({'delta': delta})}\n\n"
+
             assistant_msg = add_message(db, conv, "assistant", answer, meta=meta)
             save_routing_decision(
                 db=db,
@@ -649,9 +775,6 @@ async def stream_message(
                 reason=reason,
                 confidence=meta.get("confidence") or 1.0,
             )
-
-            for delta in chunk_text(answer):
-                yield f"event: message.delta\ndata: {json.dumps({'delta': delta})}\n\n"
 
             final_payload = serialize_message(assistant_msg)
             warning = meta.get("warning")
@@ -791,6 +914,44 @@ def download_attachment(attachment_id: int, db: Session = Depends(get_db)):
         media_type=media_type,
         headers={"Content-Disposition": f'inline; filename="{attachment.name}"'},
     )
+
+
+@app.delete("/attachments/{attachment_id}")
+def delete_attachment(attachment_id: int, db: Session = Depends(get_db)):
+    user_id = current_user_id()
+    attachment = (
+        db.query(Attachment)
+        .filter(
+            Attachment.id == attachment_id,
+            Attachment.user_id == user_id,
+        )
+        .first()
+    )
+    if not attachment:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+
+    conversation_id = attachment.conversation_id
+    path = attachment.path
+
+    delete_attachment_embeddings(
+        conversation_id=conversation_id,
+        user_id=user_id,
+        attachment_id=attachment_id,
+    )
+
+    conversation = attachment.conversation
+    db.delete(attachment)
+    if conversation:
+        conversation.updated_at = datetime.utcnow()
+    db.commit()
+
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    return {"status": "deleted"}
 
 
 @app.get("/settings")

@@ -17,6 +17,10 @@ export default function MessageBubble({ message }: MessageBubbleProps) {
       ? (message.evidence ?? []).slice(0, 3)
       : [];
   const hasEvidence = evidenceItems.length > 0;
+  const latencySeconds =
+    typeof message.meta?.latencySeconds === "number"
+      ? message.meta.latencySeconds
+      : null;
   const trimExcerpt = (value?: string | null) => {
     if (!value) return "";
     const cleaned = value.trim();
@@ -64,6 +68,11 @@ export default function MessageBubble({ message }: MessageBubbleProps) {
             <span className="text-xs">Generating response...</span>
           </div>
         )}
+        {!isUser && latencySeconds !== null ? (
+          <div className="mt-3 text-[11px] uppercase tracking-[0.18em] text-muted">
+            Answered in {latencySeconds.toFixed(1)}s
+          </div>
+        ) : null}
         {!isUser && hasEvidence ? (
           <div className="mt-4 rounded-2xl border border-border/70 bg-panel/70 p-4 text-xs text-ink shadow-soft">
             <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-muted">
