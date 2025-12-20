@@ -8,7 +8,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 DB_PATH = os.path.join(BASE_DIR, "data", "chat.db")
 DATABASE_URL = f"sqlite:///{DB_PATH}"
 
-# For SQLite + multithreaded apps like Streamlit:
+# SQLite tuning for multi-threaded API server:
 engine = create_engine(
     DATABASE_URL,
     connect_args={
@@ -26,7 +26,7 @@ Base = declarative_base()
 @event.listens_for(engine, "connect")
 def set_sqlite_pragma(dbapi_connection, _connection_record):
     """
-    Enable WAL + busy timeout for better read/write concurrency in Streamlit.
+    Enable WAL + busy timeout for better read/write concurrency in the API.
     """
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA journal_mode=WAL;")

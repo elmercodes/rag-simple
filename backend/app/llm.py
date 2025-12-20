@@ -6,13 +6,7 @@ from openai import OpenAI
 
 def _get_secret(key: str) -> str | None:
     env_val = os.getenv(key)
-    if env_val:
-        return env_val
-    try:
-        import streamlit as st  # type: ignore
-        return st.secrets.get(key)
-    except Exception:
-        return None
+    return env_val
 
 
 class ChatProvider:

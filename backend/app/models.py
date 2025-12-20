@@ -1,7 +1,20 @@
 # backend/app/models.py
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Float, JSON, UniqueConstraint
-from sqlalchemy.orm import relationship
 from datetime import datetime
+
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    JSON,
+    String,
+    Text,
+    UniqueConstraint,
+)
+from sqlalchemy.orm import relationship
+
 from .db import Base
 
 
@@ -15,10 +28,16 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     conversations = relationship("Conversation", back_populates="user")
-    documents = relationship(
-        "Document",
+    attachments = relationship(
+        "Attachment",
         back_populates="user",
         cascade="all, delete-orphan",
+    )
+    settings = relationship(
+        "UserSettings",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        uselist=False,
     )
 
 
@@ -29,6 +48,16 @@ class Conversation(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     title = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        nullable=False,
+    )
+    is_pinned = Column(Boolean, default=False, nullable=False)
+    pinned_at = Column(DateTime, nullable=True)
+    pinned_order = Column(Integer, nullable=True)
+    use_docs_default = Column(Boolean, default=False, nullable=False)
 
     user = relationship("User", back_populates="conversations")
     messages = relationship(
@@ -37,11 +66,21 @@ class Conversation(Base):
         cascade="all, delete-orphan",
         order_by="Message.created_at",
     )
-    documents = relationship(
-        "Document",
+    attachments = relationship(
+        "Attachment",
         back_populates="conversation",
         cascade="all, delete-orphan",
     )
+
+
+class UserSettings(Base):
+    __tablename__ = "user_settings"
+
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    theme = Column(String(50), nullable=True)
+    use_docs_default = Column(Boolean, default=True, nullable=False)
+
+    user = relationship("User", back_populates="settings")
 
 
 class Message(Base):
@@ -76,19 +115,19 @@ class RoutingDecision(Base):
     message = relationship("Message", back_populates="routing_decision")
 
 
-# ---- Relationships ----
-class Document(Base):
-    __tablename__ = "documents"
+# ---- Attachments ----
+class Attachment(Base):
+    __tablename__ = "attachments"
     __table_args__ = (
         UniqueConstraint(
             "conversation_id",
             "file_hash",
-            name="uq_documents_conversation_file_hash",
+            name="uq_attachments_conversation_file_hash",
         ),
     )
 
     id = Column(Integer, primary_key=True, index=True)
-    # Duplicate user_id on documents for multi-tenant safety and easier auth swap later.
+    # Duplicate user_id for multi-tenant safety and easier auth swap later.
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     conversation_id = Column(
         Integer,
@@ -96,25 +135,26 @@ class Document(Base):
         nullable=False,
         index=True,
     )
-    filename = Column(String(255), nullable=False)
-    mime_type = Column(String(255), nullable=True)
+    name = Column(String(255), nullable=False)
+    type = Column(String(50), nullable=True)
+    path = Column(String(1024), nullable=True)
     file_hash = Column(String(255), nullable=False)
     embedding_model = Column(String(255), nullable=True)
     embedding_dim = Column(Integer, nullable=True)
     vectorstore_collection = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-    user = relationship("User", back_populates="documents")
-    conversation = relationship("Conversation", back_populates="documents")
+    user = relationship("User", back_populates="attachments")
+    conversation = relationship("Conversation", back_populates="attachments")
     chunks = relationship(
-        "DocumentChunk",
-        back_populates="document",
+        "AttachmentChunk",
+        back_populates="attachment",
         cascade="all, delete-orphan",
     )
 
 
-class DocumentChunk(Base):
-    __tablename__ = "document_chunks"
+class AttachmentChunk(Base):
+    __tablename__ = "attachment_chunks"
 
     id = Column(Integer, primary_key=True, index=True)
     # Duplicate user/conversation for multi-tenant safety and future auth changes.
@@ -125,7 +165,7 @@ class DocumentChunk(Base):
         nullable=False,
         index=True,
     )
-    document_id = Column(Integer, ForeignKey("documents.id"), nullable=False, index=True)
+    attachment_id = Column(Integer, ForeignKey("attachments.id"), nullable=False, index=True)
     chunk_id = Column(String(255), nullable=False, unique=True)
     chunk_text = Column(Text, nullable=False)
     page = Column(Integer, nullable=True)
@@ -138,4 +178,4 @@ class DocumentChunk(Base):
     vectorstore_collection = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-    document = relationship("Document", back_populates="chunks")
+    attachment = relationship("Attachment", back_populates="chunks")

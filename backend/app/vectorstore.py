@@ -8,7 +8,7 @@ from typing import Tuple, List, Dict
 import chromadb
 from openai import OpenAI
 from pypdf import PdfReader
-from docx import Document
+from docx import Document as DocxDocument
 
 from .embeddings import (
     embed_texts,
@@ -18,7 +18,7 @@ from .embeddings import (
 )
 from .sectioning import detect_section_from_page_text
 from .db import SessionLocal
-from .models import Document as DocumentModel, DocumentChunk
+from .models import Attachment as AttachmentModel, AttachmentChunk
 
 
 # -------------------- Paths & Client --------------------
@@ -53,13 +53,7 @@ def _db_session():
 
 def _get_secret(key: str):
     env_val = os.getenv(key)
-    if env_val:
-        return env_val
-    try:
-        import streamlit as st  # lazy import to avoid hard dependency
-        return st.secrets.get(key)
-    except Exception:
-        return None
+    return env_val
 
 
 def _active_embedding_config() -> Dict:
@@ -85,9 +79,9 @@ def _conversation_embedding_config(conversation_id: int) -> Dict:
     """
     with _db_session() as db:
         doc = (
-            db.query(DocumentModel)
-            .filter(DocumentModel.conversation_id == conversation_id)
-            .order_by(DocumentModel.created_at.desc())
+            db.query(AttachmentModel)
+            .filter(AttachmentModel.conversation_id == conversation_id)
+            .order_by(AttachmentModel.created_at.desc())
             .first()
         )
         if doc:
@@ -242,7 +236,7 @@ def _read_txt_pages(path: str) -> List[Tuple[int, str]]:
 def _read_docx_pages(path: str) -> List[Tuple[int, str]]:
     # DOCX doesn't have true pages easily without layout engine.
     # Treat as one "page" and rely on chunking.
-    doc = Document(path)
+    doc = DocxDocument(path)
     paras = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
     text = "\n".join(paras)
     return [(1, text)]
@@ -311,6 +305,7 @@ def ingest_file(
     conversation_id: int,
     user_id: int,
     mime_type: str | None = None,
+    attachment_type: str | None = None,
 ) -> str:
     """
     Read a file (PDF/TXT/DOCX), chunk it, embed it, and store in Chroma.
@@ -323,6 +318,11 @@ def ingest_file(
     """
     doc_id = _stable_doc_id(path)
     filename = os.path.basename(path)
+    if not attachment_type:
+        ext = os.path.splitext(filename)[1].lower()
+        if ext.startswith("."):
+            ext = ext[1:]
+        attachment_type = ext or mime_type
     embedding_cfg = _active_embedding_config()
     collection = _collection_for_config(embedding_cfg)
 
@@ -330,47 +330,49 @@ def ingest_file(
     _delete_existing_doc(doc_id, conversation_id, user_id, collection)
 
     with _db_session() as db:
-        doc = (
-            db.query(DocumentModel)
+        attachment = (
+            db.query(AttachmentModel)
             .filter(
-                DocumentModel.conversation_id == conversation_id,
-                DocumentModel.file_hash == doc_id,
+                AttachmentModel.conversation_id == conversation_id,
+                AttachmentModel.file_hash == doc_id,
             )
             .first()
         )
 
-        if not doc:
-            doc = DocumentModel(
+        if not attachment:
+            attachment = AttachmentModel(
                 user_id=user_id,
                 conversation_id=conversation_id,
-                filename=filename,
-                mime_type=mime_type,
+                name=filename,
+                type=attachment_type or mime_type,
+                path=path,
                 file_hash=doc_id,
                 embedding_model=embedding_cfg["embedding_model"],
                 embedding_dim=embedding_cfg["embedding_dim"],
                 vectorstore_collection=embedding_cfg["vectorstore_collection"],
             )
-            db.add(doc)
+            db.add(attachment)
             db.commit()
-            db.refresh(doc)
+            db.refresh(attachment)
         else:
-            doc.filename = filename
-            doc.mime_type = mime_type
-            doc.embedding_model = embedding_cfg["embedding_model"]
-            doc.embedding_dim = embedding_cfg["embedding_dim"]
-            doc.vectorstore_collection = embedding_cfg["vectorstore_collection"]
-            # Keep document row, but refresh chunks on re-upload/update.
-            db.query(DocumentChunk).filter(
-                DocumentChunk.document_id == doc.id
+            attachment.name = filename
+            attachment.type = attachment_type or mime_type
+            attachment.path = path
+            attachment.embedding_model = embedding_cfg["embedding_model"]
+            attachment.embedding_dim = embedding_cfg["embedding_dim"]
+            attachment.vectorstore_collection = embedding_cfg["vectorstore_collection"]
+            # Keep attachment row, but refresh chunks on re-upload/update.
+            db.query(AttachmentChunk).filter(
+                AttachmentChunk.attachment_id == attachment.id
             ).delete()
             db.commit()
 
-        document_db_id = doc.id
+        attachment_db_id = attachment.id
 
     ids: List[str] = []
     docs: List[str] = []
     metas: List[Dict] = []
-    chunk_rows: List[DocumentChunk] = []
+    chunk_rows: List[AttachmentChunk] = []
 
     current_section = "other"
 
@@ -409,7 +411,7 @@ def ingest_file(
                 "preview": preview,
                 "conversation_id": conversation_id,
                 "user_id": user_id,
-                "document_id": document_db_id,
+                "attachment_id": attachment_db_id,
                 "chunk_id": chunk_id,
                 "embedding_model": embedding_cfg["embedding_model"],
                 "embedding_dim": embedding_cfg["embedding_dim"],
@@ -419,10 +421,10 @@ def ingest_file(
             metas.append(chunk_meta)
 
             chunk_rows.append(
-                DocumentChunk(
+                AttachmentChunk(
                     user_id=user_id,
                     conversation_id=conversation_id,
-                    document_id=document_db_id,
+                    attachment_id=attachment_db_id,
                     chunk_id=chunk_id,
                     chunk_text=chunk,
                     page=page_idx,
@@ -546,6 +548,7 @@ def retrieve_hits(
 
     for doc, meta, dist in rows:
         section = meta.get("section", "other")
+        attachment_id = meta.get("attachment_id") or meta.get("document_id")
 
         # --- base similarity score ---
         score = _similarity_from_distance(dist)
@@ -583,6 +586,7 @@ def retrieve_hits(
             "filename": meta.get("filename"),
             "page": meta.get("page"),
             "doc_id": meta.get("doc_id"),
+            "attachment_id": attachment_id,
             "chunk_index": meta.get("chunk_index"),
             "section": section,
         })
@@ -661,3 +665,17 @@ def build_context_and_sources(
     context = "\n\n---\n\n".join(h["text"] for h in selected_hits)
 
     return context, sources, selected_hits
+
+
+def delete_conversation_embeddings(conversation_id: int, user_id: int) -> None:
+    """
+    Remove all vector entries for a conversation across known collections.
+    """
+    collections = {ACTIVE_COLLECTION_NAME, LEGACY_COLLECTION_NAME}
+    for name in collections:
+        collection = _get_collection(name)
+        try:
+            collection.delete(where=_scoped_where(conversation_id, user_id))
+        except Exception:
+            # Best-effort cleanup; ignore collection-specific failures.
+            continue

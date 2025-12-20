@@ -1,6 +1,6 @@
+from functools import lru_cache
 from typing import List
 
-import streamlit as st
 from sentence_transformers import SentenceTransformer
 
 
@@ -8,9 +8,9 @@ EMBEDDING_MODEL = "BAAI/bge-large-en-v1.5"
 EMBEDDING_DIMENSION = 1024
 
 
-@st.cache_resource(show_spinner=False)
+@lru_cache(maxsize=1)
 def _load_model() -> SentenceTransformer:
-    # Cache the model across Streamlit reruns so we don't reload on each request.
+    # Cache the model across API workers so we don't reload on each request.
     return SentenceTransformer(EMBEDDING_MODEL)
 
 
