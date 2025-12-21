@@ -17,11 +17,8 @@ __pycache__/
 Thumbs.db
 
 # Data (optional):
-data/raw/
-data/processed/
+data/
 chat.db
-data/vector_store/
-
 # Folder
 .env
 

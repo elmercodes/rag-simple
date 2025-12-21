@@ -48,6 +48,8 @@ DEFAULT_VLLM_MODEL = os.getenv("VLLM_MODEL_NAME", "qwen-3")
 MAX_TURNS = int(os.getenv("MAX_TURNS", "8"))
 MAX_PINNED = 5
 MAX_ATTACHMENTS = 5
+MIN_RERANK_SCORE_MANUAL = 0.20
+MIN_RERANK_SCORE_GENERAL = 0.18
 SUPPORTED_ATTACHMENT_TYPES = {"pdf", "txt", "docx"}
 SUPPORTED_EMBEDDING_MODELS = ("openai-embeddings", "bge-large-en-v1.5")
 DEFAULT_EMBEDDING_MODEL = "openai-embeddings"
@@ -417,6 +419,51 @@ def generate_answer(
         policy = "manual"
 
     refusal = "I can’t find a supported answer in the provided document excerpts."
+    is_research = conversation.focus_type == 0
+    if conversation.focus_type in (1, 2):
+        if not context.strip():
+            meta = {
+                "use_docs": True,
+                "citations": [],
+                "evidence": [],
+                "answer_mode": "rag",
+                "verdict": "UNSUPPORTED",
+                "confidence": 0.0,
+                "warning": warning,
+                "sources": [],
+                "doc_policy": policy,
+                "focus_type": focus_type,
+                "verifyAttempts": 1,
+            }
+            routing_reason = "Low retrieval relevance — refused."
+            return refusal, meta, routing_reason
+        top_score = 0.0
+        if hits:
+            top_score = float(
+                hits[0].get("rerank_score", hits[0].get("score", 0.0)) or 0.0
+            )
+        threshold = (
+            MIN_RERANK_SCORE_MANUAL
+            if conversation.focus_type == 1
+            else MIN_RERANK_SCORE_GENERAL
+        )
+        if top_score < threshold:
+            meta = {
+                "use_docs": True,
+                "citations": [],
+                "evidence": [],
+                "answer_mode": "rag",
+                "verdict": "UNSUPPORTED",
+                "confidence": 0.0,
+                "warning": warning,
+                "sources": [],
+                "doc_policy": policy,
+                "focus_type": focus_type,
+                "verifyAttempts": 1,
+            }
+            routing_reason = "Low retrieval relevance — refused."
+            return refusal, meta, routing_reason
+
     final_answer, vdebug = verify_answer(
         chat_client=chat_client,
         model=model,
@@ -429,8 +476,9 @@ def generate_answer(
     )
     verdict = (vdebug or {}).get("verdict", "UNSUPPORTED")
     confidence = float((vdebug or {}).get("confidence", 0.0) or 0.0)
+    verify_attempts = 1
 
-    if verdict == "UNSUPPORTED":
+    if is_research and verdict == "UNSUPPORTED":
         retry_system = (
             "You are answering using document excerpts.\n"
             "Rewrite the answer so every key claim is directly supported or clearly deducible from the excerpts.\n"
@@ -461,6 +509,7 @@ def generate_answer(
         )
         verdict = (vdebug or {}).get("verdict", "UNSUPPORTED")
         confidence = float((vdebug or {}).get("confidence", 0.0) or 0.0)
+        verify_attempts = 2
 
     citations = build_citations(evidence_hits, verdict)
     evidence = build_evidence(evidence_hits, verdict)
@@ -479,6 +528,7 @@ def generate_answer(
         "sources": sources_field,
         "doc_policy": policy,
         "focus_type": focus_type,
+        "verifyAttempts": verify_attempts,
     }
     routing_reason = "RAG enabled with document retrieval."
     return final_answer, meta, routing_reason

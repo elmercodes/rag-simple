@@ -41,14 +41,24 @@ def _judge_system_prompt(policy: str) -> str:
     if policy == "manual":
         return (
             "You are verifying an assistant answer using manual excerpts.\n"
-            "Be moderately strict: allow implied procedural steps and common-sense guidance.\n"
-            "If some support exists but details are thin, choose PARTIAL and provide a hedged answer.\n\n"
+            "Be strict about relevance: the answer must be clearly grounded in the excerpts.\n"
+            "If the answer could have been written without reading the excerpts, choose UNSUPPORTED.\n"
+            "If the excerpts are about a different topic than the draft, choose UNSUPPORTED.\n"
+            "If the answer is generic and not grounded in the excerpts, choose UNSUPPORTED.\n"
+            "Common sense is allowed only when it is clearly anchored to excerpt facts or procedures.\n"
+            "If some support exists but details are thin, choose PARTIAL and provide a hedged answer.\n"
+            "If the answer has virtually no connection to the excerpts, choose UNSUPPORTED.\n\n"
             + base
         )
     return (
         "You are verifying an assistant answer using general document excerpts.\n"
-        "Be lenient: allow high-level inference and paraphrase.\n"
-        "If the excerpts provide partial support, choose PARTIAL and hedge instead of refusing.\n\n"
+        "Be strict about relevance: the answer must be clearly grounded in the excerpts.\n"
+        "If the answer could have been written without reading the excerpts, choose UNSUPPORTED.\n"
+        "If the excerpts are about a different topic than the draft, choose UNSUPPORTED.\n"
+        "If the answer is generic and not grounded in the excerpts, choose UNSUPPORTED.\n"
+        "Common sense is allowed only when it is clearly anchored to excerpt facts.\n"
+        "If the excerpts provide partial support, choose PARTIAL and hedge instead of refusing.\n"
+        "If the answer has virtually no connection to the excerpts, choose UNSUPPORTED.\n\n"
         + base
     )
 
