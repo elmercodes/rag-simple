@@ -96,6 +96,7 @@ def _rebuild_conversations_table(default_user_id: int) -> None:
     SQLite cannot alter column nullability; rebuild conversations with NOT NULL user_id
     and the newer metadata columns.
     """
+    has_focus_type = "focus_type" in _column_names("conversations")
     with engine.begin() as conn:
         conn.execute(text("PRAGMA foreign_keys=off"))
 
@@ -112,6 +113,8 @@ def _rebuild_conversations_table(default_user_id: int) -> None:
                     pinned_at DATETIME,
                     pinned_order INTEGER,
                     use_docs_default BOOLEAN DEFAULT 0 NOT NULL,
+                    focus_type INTEGER,
+                    embedding_model VARCHAR(64),
                     PRIMARY KEY (id),
                     FOREIGN KEY(user_id) REFERENCES users (id)
                 )
@@ -119,11 +122,15 @@ def _rebuild_conversations_table(default_user_id: int) -> None:
             )
         )
 
+        focus_select = "focus_type" if has_focus_type else "NULL"
+        embedding_select = (
+            "embedding_model" if "embedding_model" in _column_names("conversations") else "NULL"
+        )
         conn.execute(
             text(
-                """
-                INSERT INTO conversations_new (id, user_id, title, created_at, updated_at, is_pinned, pinned_at, pinned_order, use_docs_default)
-                SELECT id, COALESCE(user_id, :default_user_id), title, created_at, COALESCE(updated_at, CURRENT_TIMESTAMP), COALESCE(is_pinned, 0), pinned_at, pinned_order, COALESCE(use_docs_default, 0)
+                f"""
+                INSERT INTO conversations_new (id, user_id, title, created_at, updated_at, is_pinned, pinned_at, pinned_order, use_docs_default, focus_type, embedding_model)
+                SELECT id, COALESCE(user_id, :default_user_id), title, created_at, COALESCE(updated_at, CURRENT_TIMESTAMP), COALESCE(is_pinned, 0), pinned_at, pinned_order, COALESCE(use_docs_default, 0), {focus_select}, {embedding_select}
                 FROM conversations
                 """
             ),
@@ -142,6 +149,8 @@ def _ensure_conversation_columns():
     _add_column_if_missing("conversations", "pinned_at", "DATETIME")
     _add_column_if_missing("conversations", "pinned_order", "INTEGER")
     _add_column_if_missing("conversations", "use_docs_default", "BOOLEAN DEFAULT 0")
+    _add_column_if_missing("conversations", "focus_type", "INTEGER")
+    _add_column_if_missing("conversations", "embedding_model", "VARCHAR(64)")
 
 
 def _ensure_conversation_index():
@@ -205,6 +214,7 @@ def _ensure_attachment_metadata_columns():
         _add_column_if_missing("attachments", "embedding_model", "VARCHAR(255)")
         _add_column_if_missing("attachments", "embedding_dim", "INTEGER")
         _add_column_if_missing("attachments", "vectorstore_collection", "VARCHAR(255)")
+        _add_column_if_missing("attachments", "doc_type", "INTEGER")
     if _table_exists("attachment_chunks"):
         _add_column_if_missing("attachment_chunks", "embedding_model", "VARCHAR(255)")
         _add_column_if_missing("attachment_chunks", "embedding_dim", "INTEGER")
@@ -224,6 +234,11 @@ def _ensure_user_settings(default_user_id: int):
         )
 
 
+def _ensure_user_settings_columns():
+    if _table_exists("user_settings"):
+        _add_column_if_missing("user_settings", "embedding_model", "VARCHAR(64)")
+
+
 def run_migrations() -> int:
     """
     Apply safe, idempotent migrations and return the default local user id.
@@ -238,5 +253,6 @@ def run_migrations() -> int:
     _ensure_conversation_index()
     _ensure_attachment_metadata_columns()
     _copy_documents_to_attachments()
+    _ensure_user_settings_columns()
     _ensure_user_settings(default_user_id)
     return default_user_id

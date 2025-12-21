@@ -34,6 +34,9 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger
 } from "@/components/ui/dropdown-menu";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -41,7 +44,8 @@ import { cn } from "@/lib/utils";
 import type {
   AIModel,
   Attachment,
-  Conversation
+  Conversation,
+  FocusType
 } from "@/components/chat/chat-app";
 
 type SidebarProps = {
@@ -59,6 +63,7 @@ type SidebarProps = {
   onDeleteConversation: (id: string) => void;
   onReorderPinned: (ids: string[]) => void;
   onSelectModel: (model: AIModel) => void;
+  onUpdateFocus: (id: string, focusType: FocusType) => void;
 };
 
 export default function Sidebar({
@@ -75,9 +80,15 @@ export default function Sidebar({
   onTogglePin,
   onDeleteConversation,
   onReorderPinned,
-  onSelectModel
+  onSelectModel,
+  onUpdateFocus
 }: SidebarProps) {
   const modelOptions: AIModel[] = ["gpt-5-nano", "Qwen3"];
+  const focusOptions: { label: string; value: FocusType }[] = [
+    { label: "Research paper", value: 0 },
+    { label: "Manual", value: 1 },
+    { label: "Other", value: 2 }
+  ];
   const sensors = useSensors(
     useSensor(PointerSensor, {
       activationConstraint: { distance: 5 }
@@ -96,6 +107,9 @@ export default function Sidebar({
     sortable?: ReturnType<typeof useSortable>
   ) => {
     const isActive = conversation.id === activeId;
+    const attachmentCount = isActive
+      ? attachments.length
+      : conversation.attachments.length;
     const draggableStyle =
       sortable && (sortable.transform || sortable.transition)
         ? {
@@ -181,6 +195,28 @@ export default function Sidebar({
                 )}
                 <span>{conversation.isPinned ? "Unpin" : "Pin"}</span>
               </DropdownMenuItem>
+              <DropdownMenuSub>
+                <DropdownMenuSubTrigger disabled={attachmentCount === 0}>
+                  Conversation focus
+                </DropdownMenuSubTrigger>
+                <DropdownMenuSubContent side="right" align="start" sideOffset={8}>
+                  {focusOptions.map((option) => (
+                    <DropdownMenuItem
+                      key={option.value}
+                      onSelect={(event) => {
+                        event.preventDefault();
+                        onUpdateFocus(conversation.id, option.value);
+                      }}
+                      className="flex items-center justify-between text-ink"
+                    >
+                      <span>{option.label}</span>
+                      {conversation.focusType === option.value ? (
+                        <Check className="h-4 w-4" />
+                      ) : null}
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuSubContent>
+              </DropdownMenuSub>
               <DropdownMenuItem
                 className="text-red-500 focus:text-red-500"
                 onSelect={(event) => {

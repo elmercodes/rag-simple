@@ -6,14 +6,12 @@ from collections import defaultdict
 from typing import Tuple, List, Dict
 
 import chromadb
-from openai import OpenAI
 from pypdf import PdfReader
 from docx import Document as DocxDocument
 
 from .embeddings import (
     embed_texts,
     embed_query,
-    embedding_model_name,
     embedding_dimension,
 )
 from .sectioning import detect_section_from_page_text
@@ -35,10 +33,7 @@ _collections: Dict[str, chromadb.api.models.Collection.Collection] = {}
 
 # Legacy (OpenAI) + new BGE collection names
 LEGACY_COLLECTION_NAME = "docs"  # existing collection with OpenAI embeddings
-ACTIVE_COLLECTION_NAME = "chroma_bge_large_en_v1_5"
-
-LEGACY_EMBEDDING_MODEL = "text-embedding-3-small"
-LEGACY_EMBEDDING_DIM = 1536
+BGE_COLLECTION_NAME = "chroma_bge_large_en_v1_5"
 
 
 def _get_collection(name: str):
@@ -51,61 +46,20 @@ def _db_session():
     return SessionLocal()
 
 
-def _get_secret(key: str):
-    env_val = os.getenv(key)
-    return env_val
-
-
-def _active_embedding_config() -> Dict:
-    return {
-        "embedding_model": embedding_model_name(),
-        "embedding_dim": embedding_dimension(),
-        "vectorstore_collection": ACTIVE_COLLECTION_NAME,
-    }
-
-
-def _legacy_embedding_config() -> Dict:
-    return {
-        "embedding_model": LEGACY_EMBEDDING_MODEL,
-        "embedding_dim": LEGACY_EMBEDDING_DIM,
-        "vectorstore_collection": LEGACY_COLLECTION_NAME,
-    }
-
-
-def _conversation_embedding_config(conversation_id: int) -> Dict:
-    """
-    Determine which collection/embedding settings to use for a conversation.
-    Falls back to legacy if documents exist without metadata.
-    """
-    with _db_session() as db:
-        doc = (
-            db.query(AttachmentModel)
-            .filter(AttachmentModel.conversation_id == conversation_id)
-            .order_by(AttachmentModel.created_at.desc())
-            .first()
-        )
-        if doc:
-            if doc.vectorstore_collection:
-                return {
-                    "embedding_model": doc.embedding_model
-                    or (
-                        LEGACY_EMBEDDING_MODEL
-                        if doc.vectorstore_collection == LEGACY_COLLECTION_NAME
-                        else embedding_model_name()
-                    ),
-                    "embedding_dim": doc.embedding_dim
-                    or (
-                        LEGACY_EMBEDDING_DIM
-                        if doc.vectorstore_collection == LEGACY_COLLECTION_NAME
-                        else embedding_dimension()
-                    ),
-                    "vectorstore_collection": doc.vectorstore_collection,
-                }
-            # Documents with no recorded collection are assumed to be legacy.
-            return _legacy_embedding_config()
-
-    # No documents for this conversation yet: default to active BGE collection.
-    return _active_embedding_config()
+def _embedding_config_for_model(embedding_model: str) -> Dict:
+    if embedding_model == "openai-embeddings":
+        return {
+            "embedding_model": embedding_model,
+            "embedding_dim": embedding_dimension(embedding_model),
+            "vectorstore_collection": LEGACY_COLLECTION_NAME,
+        }
+    if embedding_model == "bge-large-en-v1.5":
+        return {
+            "embedding_model": embedding_model,
+            "embedding_dim": embedding_dimension(embedding_model),
+            "vectorstore_collection": BGE_COLLECTION_NAME,
+        }
+    raise ValueError(f"Unsupported embedding model: {embedding_model}")
 
 
 def _collection_for_config(cfg: Dict):
@@ -175,27 +129,9 @@ def _page_key(doc_id: str, filename: str, page: int) -> Tuple[str, str, int]:
     return (doc_id, filename, page)
 
 
-def _legacy_embed_query(query: str) -> List[float]:
-    """
-    Compatibility path for legacy OpenAI embeddings.
-    """
-    api_key = _get_secret("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY required for legacy embedding lookups.")
-    client = OpenAI(api_key=api_key)
-    resp = client.embeddings.create(
-        model=LEGACY_EMBEDDING_MODEL,
-        input=[query],
-    )
-    return resp.data[0].embedding
-
-
 def _embed_query(query: str, cfg: Dict) -> List[float]:
     """Embed a single query using the embedding model tied to the collection."""
-    collection_name = cfg.get("vectorstore_collection")
-    if collection_name == LEGACY_COLLECTION_NAME:
-        return _legacy_embed_query(query)
-    return embed_query(query)
+    return embed_query(query, cfg["embedding_model"])
 
 
 def _similarity_from_distance(distance: float) -> float:
@@ -304,6 +240,7 @@ def ingest_file(
     path: str,
     conversation_id: int,
     user_id: int,
+    embedding_model: str,
     mime_type: str | None = None,
     attachment_type: str | None = None,
 ) -> str:
@@ -323,7 +260,7 @@ def ingest_file(
         if ext.startswith("."):
             ext = ext[1:]
         attachment_type = ext or mime_type
-    embedding_cfg = _active_embedding_config()
+    embedding_cfg = _embedding_config_for_model(embedding_model)
     collection = _collection_for_config(embedding_cfg)
 
     # Remove previously ingested chunks for this doc (so re-upload updates)
@@ -442,7 +379,7 @@ def ingest_file(
     if not docs:
         return doc_id
 
-    vectors = embed_texts(docs)
+    vectors = embed_texts(docs, embedding_model)
 
     collection.add(
         ids=ids,
@@ -464,6 +401,7 @@ def retrieve_context_and_sources(
     query: str,
     user_id: int,
     conversation_id: int,
+    embedding_model: str,
     k: int = 8,
     top_pages: int = 2,
 ) -> Tuple[str, List[Dict]]:
@@ -473,7 +411,7 @@ def retrieve_context_and_sources(
     - context: concatenated top-k chunk texts
     - sources: list of top 'page' hits with filename + page number
     """
-    embedding_cfg = _conversation_embedding_config(conversation_id)
+    embedding_cfg = _embedding_config_for_model(embedding_model)
     collection = _collection_for_config(embedding_cfg)
     q_vec = _embed_query(query, embedding_cfg)
 
@@ -518,12 +456,13 @@ def retrieve_hits(
     query: str,
     user_id: int,
     conversation_id: int,
+    embedding_model: str,
     k: int = 30,
     intent: str = "general",
     hard_sections: list[str] | None = None,
     preferred: list[str] | None = None,
 ) -> List[Dict]:
-    embedding_cfg = _conversation_embedding_config(conversation_id)
+    embedding_cfg = _embedding_config_for_model(embedding_model)
     collection = _collection_for_config(embedding_cfg)
     q_vec = _embed_query(query, embedding_cfg)
 
@@ -671,7 +610,7 @@ def delete_conversation_embeddings(conversation_id: int, user_id: int) -> None:
     """
     Remove all vector entries for a conversation across known collections.
     """
-    collections = {ACTIVE_COLLECTION_NAME, LEGACY_COLLECTION_NAME}
+    collections = {BGE_COLLECTION_NAME, LEGACY_COLLECTION_NAME}
     for name in collections:
         collection = _get_collection(name)
         try:
@@ -689,7 +628,7 @@ def delete_attachment_embeddings(
     """
     Remove vector entries for a single attachment across known collections.
     """
-    collections = {ACTIVE_COLLECTION_NAME, LEGACY_COLLECTION_NAME}
+    collections = {BGE_COLLECTION_NAME, LEGACY_COLLECTION_NAME}
     for name in collections:
         collection = _get_collection(name)
         try:

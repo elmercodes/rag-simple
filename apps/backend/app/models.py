@@ -58,6 +58,8 @@ class Conversation(Base):
     pinned_at = Column(DateTime, nullable=True)
     pinned_order = Column(Integer, nullable=True)
     use_docs_default = Column(Boolean, default=False, nullable=False)
+    focus_type = Column(Integer, nullable=True)  # 0=research, 1=manual, 2=other
+    embedding_model = Column(String(64), nullable=True)
 
     user = relationship("User", back_populates="conversations")
     messages = relationship(
@@ -79,6 +81,7 @@ class UserSettings(Base):
     user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
     theme = Column(String(50), nullable=True)
     use_docs_default = Column(Boolean, default=True, nullable=False)
+    embedding_model = Column(String(64), nullable=True)
 
     user = relationship("User", back_populates="settings")
 

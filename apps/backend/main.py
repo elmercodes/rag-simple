@@ -49,6 +49,8 @@ MAX_TURNS = int(os.getenv("MAX_TURNS", "8"))
 MAX_PINNED = 5
 MAX_ATTACHMENTS = 5
 SUPPORTED_ATTACHMENT_TYPES = {"pdf", "txt", "docx"}
+SUPPORTED_EMBEDDING_MODELS = ("openai-embeddings", "bge-large-en-v1.5")
+DEFAULT_EMBEDDING_MODEL = "openai-embeddings"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(BASE_DIR)
@@ -88,6 +90,11 @@ def model_for_provider(provider: str) -> str:
     return DEFAULT_VLLM_MODEL
 
 
+def resolve_embedding_model(settings: UserSettings | None) -> str:
+    value = settings.embedding_model if settings else None
+    return value if value in SUPPORTED_EMBEDDING_MODELS else DEFAULT_EMBEDDING_MODEL
+
+
 def serialize_attachment(a: Attachment) -> Dict:
     return {
         "id": a.id,
@@ -114,6 +121,8 @@ def serialize_message(msg: Message) -> Dict:
             "confidence": meta.get("confidence"),
             "warning": meta.get("warning"),
             "latencySeconds": meta.get("latency_seconds"),
+            "docPolicy": meta.get("doc_policy"),
+            "focusType": meta.get("focus_type") if "focus_type" in meta else meta.get("focusType"),
         },
     }
 
@@ -127,6 +136,8 @@ def serialize_conversation(conv: Conversation) -> Dict:
         "isPinned": bool(conv.is_pinned),
         "pinnedAt": isoformat(conv.pinned_at),
         "pinnedOrder": conv.pinned_order,
+        "focusType": conv.focus_type,
+        "embeddingModel": conv.embedding_model,
     }
 
 
@@ -350,6 +361,7 @@ def generate_answer(
             "verdict": None,
             "confidence": None,
             "warning": warning,
+            "focus_type": conversation.focus_type,
         }
         routing_reason = warning or "Answered without document retrieval."
         return answer, meta, routing_reason
@@ -358,11 +370,13 @@ def generate_answer(
     intent = classify_intent(user_message)
     preferred = preferred_sections(intent)
     hard_sections = preferred if should_hard_filter(intent) and preferred else None
+    embedding_model = conversation.embedding_model or DEFAULT_EMBEDDING_MODEL
 
     hits = retrieve_hits(
         user_message,
         user_id=user_id,
         conversation_id=conversation.id,
+        embedding_model=embedding_model,
         k=30,
         intent=intent,
         hard_sections=hard_sections,
@@ -395,6 +409,13 @@ def generate_answer(
     )
     draft = resp.choices[0].message.content or ""
 
+    focus_type = conversation.focus_type
+    policy = "general"
+    if focus_type == 0:
+        policy = "research"
+    elif focus_type == 1:
+        policy = "manual"
+
     refusal = "I can’t find a supported answer in the provided document excerpts."
     final_answer, vdebug = verify_answer(
         chat_client=chat_client,
@@ -404,6 +425,7 @@ def generate_answer(
         context=context,
         evidence_hits=evidence_hits,
         refusal_text=refusal,
+        policy=policy,
     )
     verdict = (vdebug or {}).get("verdict", "UNSUPPORTED")
     confidence = float((vdebug or {}).get("confidence", 0.0) or 0.0)
@@ -435,6 +457,7 @@ def generate_answer(
             context=context,
             evidence_hits=evidence_hits,
             refusal_text=refusal,
+            policy=policy,
         )
         verdict = (vdebug or {}).get("verdict", "UNSUPPORTED")
         confidence = float((vdebug or {}).get("confidence", 0.0) or 0.0)
@@ -454,6 +477,8 @@ def generate_answer(
         "confidence": confidence,
         "warning": warning,
         "sources": sources_field,
+        "doc_policy": policy,
+        "focus_type": focus_type,
     }
     routing_reason = "RAG enabled with document retrieval."
     return final_answer, meta, routing_reason
@@ -569,6 +594,9 @@ def update_conversation(
 
     title = payload.get("title")
     is_pinned = payload.get("isPinned")
+    missing = object()
+    focus_type = payload.get("focusType", missing)
+    embedding_model = payload.get("embeddingModel", missing)
 
     if title is not None:
         conv.title = title.strip() or conv.title
@@ -585,6 +613,37 @@ def update_conversation(
             conv.is_pinned = False
             conv.pinned_at = None
             conv.pinned_order = None
+        conv.updated_at = datetime.utcnow()
+
+    if focus_type is not missing:
+        attachments_count = count_attachments(db, conv.id, user_id)
+        if attachments_count == 0:
+            conv.focus_type = None
+        else:
+            if focus_type is None:
+                conv.focus_type = None
+            elif focus_type in (0, 1, 2):
+                conv.focus_type = int(focus_type)
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail="focusType must be 0, 1, 2, or null.",
+                )
+        conv.updated_at = datetime.utcnow()
+
+    if embedding_model is not missing:
+        if embedding_model not in (*SUPPORTED_EMBEDDING_MODELS, None):
+            raise HTTPException(
+                status_code=400,
+                detail="Unsupported embeddingModel.",
+            )
+        attachments_count = count_attachments(db, conv.id, user_id)
+        if attachments_count > 0 and conv.embedding_model is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Embedding model is locked once documents exist.",
+            )
+        conv.embedding_model = embedding_model
         conv.updated_at = datetime.utcnow()
 
     db.commit()
@@ -852,10 +911,18 @@ async def upload_attachment(
     with open(path, "wb") as f:
         f.write(data)
 
+    settings = (
+        db.query(UserSettings).filter(UserSettings.user_id == user_id).first()
+    )
+    chosen_embedding_model = (
+        conv.embedding_model or resolve_embedding_model(settings)
+    )
+
     ingest_file(
         path,
         conversation_id=conversation_id,
         user_id=user_id,
+        embedding_model=chosen_embedding_model,
         mime_type=file.content_type,
         attachment_type=ext,
     )
@@ -883,7 +950,20 @@ async def upload_attachment(
     else:
         raise HTTPException(status_code=500, detail="Failed to persist attachment.")
 
-    return serialize_attachment(attachment)
+    attachments_count = count_attachments(db, conversation_id, user_id)
+    if attachments_count == 1 and conv.embedding_model is None:
+        conv.embedding_model = chosen_embedding_model
+        conv.updated_at = datetime.utcnow()
+        db.commit()
+        db.refresh(conv)
+    needs_focus_prompt = conv.focus_type is None and attachments_count == 1
+    payload = serialize_attachment(attachment)
+    payload["needsFocusPrompt"] = needs_focus_prompt
+    payload["conversationEmbeddingModel"] = conv.embedding_model
+    payload["embeddingLocked"] = (
+        attachments_count > 0 and conv.embedding_model is not None
+    )
+    return payload
 
 
 @app.get("/attachments/{attachment_id}/content")
@@ -951,7 +1031,24 @@ def delete_attachment(attachment_id: int, db: Session = Depends(get_db)):
         except OSError:
             pass
 
-    return {"status": "deleted"}
+    remaining = count_attachments(db, conversation_id, user_id)
+    focus_type = None
+    embedding_model = None
+    if conversation and remaining == 0:
+        conversation.focus_type = None
+        conversation.embedding_model = None
+        conversation.updated_at = datetime.utcnow()
+        db.commit()
+    if conversation:
+        focus_type = conversation.focus_type
+        embedding_model = conversation.embedding_model
+
+    return {
+        "status": "deleted",
+        "conversationId": conversation_id,
+        "focusType": focus_type,
+        "embeddingModel": embedding_model,
+    }
 
 
 @app.get("/settings")
@@ -959,13 +1056,19 @@ def get_settings(db: Session = Depends(get_db)):
     user_id = current_user_id()
     settings = db.query(UserSettings).filter(UserSettings.user_id == user_id).first()
     if not settings:
-        settings = UserSettings(user_id=user_id, theme=None, use_docs_default=True)
+        settings = UserSettings(
+            user_id=user_id,
+            theme=None,
+            use_docs_default=True,
+            embedding_model=DEFAULT_EMBEDDING_MODEL,
+        )
         db.add(settings)
         db.commit()
         db.refresh(settings)
     return {
         "theme": settings.theme,
         "useDocs": bool(settings.use_docs_default),
+        "embeddingModel": resolve_embedding_model(settings),
     }
 
 
@@ -974,17 +1077,28 @@ def update_settings(payload: Dict = Body(...), db: Session = Depends(get_db)):
     user_id = current_user_id()
     settings = db.query(UserSettings).filter(UserSettings.user_id == user_id).first()
     if not settings:
-        settings = UserSettings(user_id=user_id, theme=None, use_docs_default=True)
+        settings = UserSettings(
+            user_id=user_id,
+            theme=None,
+            use_docs_default=True,
+            embedding_model=DEFAULT_EMBEDDING_MODEL,
+        )
         db.add(settings)
 
     if "theme" in payload:
         settings.theme = payload.get("theme")
     if "useDocs" in payload:
         settings.use_docs_default = bool(payload.get("useDocs"))
+    if "embeddingModel" in payload:
+        value = payload.get("embeddingModel")
+        if value not in SUPPORTED_EMBEDDING_MODELS:
+            raise HTTPException(status_code=400, detail="Unsupported embedding model.")
+        settings.embedding_model = value
 
     db.commit()
     db.refresh(settings)
     return {
         "theme": settings.theme,
         "useDocs": bool(settings.use_docs_default),
+        "embeddingModel": resolve_embedding_model(settings),
     }

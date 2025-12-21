@@ -6,9 +6,19 @@ import ChatThread from "@/components/chat/chat-thread";
 import Composer from "@/components/chat/composer";
 import TitleEditor from "@/components/chat/title-editor";
 import AttachmentViewer from "@/components/chat/attachment-viewer";
+import ConversationFocusModal from "@/components/chat/conversation-focus-modal";
+import DeleteAttachmentModal from "@/components/chat/delete-attachment-modal";
 import { Button } from "@/components/ui/button";
 import { useTheme, type Theme } from "@/components/theme-provider";
-import { Settings, Moon, Sun, PanelLeft, X } from "lucide-react";
+import {
+  Settings,
+  Moon,
+  Sun,
+  PanelLeft,
+  X,
+  ChevronDown,
+  Check
+} from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
   ApiError,
@@ -21,6 +31,12 @@ import {
   streamSSE,
   uploadFile
 } from "@/lib/api";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger
+} from "@/components/ui/dropdown-menu";
 
 export type Message = {
   id?: string;
@@ -44,6 +60,8 @@ export type Attachment = {
 };
 
 export type AIModel = "gpt-5-nano" | "Qwen3";
+export type EmbeddingModel = "openai-embeddings" | "bge-large-en-v1.5";
+export type FocusType = 0 | 1 | 2;
 
 export type Conversation = {
   id: string;
@@ -55,6 +73,8 @@ export type Conversation = {
   isPinned: boolean;
   pinnedAt: string | null;
   pinnedOrder: number | null;
+  focusType: FocusType | null;
+  embeddingModel: EmbeddingModel | null;
 };
 
 type ConversationPayload = Omit<Conversation, "messages" | "attachments">;
@@ -83,6 +103,8 @@ type BackendMessage = {
     confidence?: number | null;
     warning?: string | null;
     latencySeconds?: number | null;
+    docPolicy?: "research" | "manual" | "general" | string | null;
+    focusType?: number | null;
   };
   warning?: string;
 };
@@ -92,6 +114,9 @@ type BackendAttachment = {
   name: string;
   type: string | null;
   createdAt?: string;
+  needsFocusPrompt?: boolean;
+  conversationEmbeddingModel?: EmbeddingModel | null;
+  embeddingLocked?: boolean;
 };
 
 const timestamp = (value?: string | null) =>
@@ -117,6 +142,15 @@ const normalizeConversation = (
   pinnedAt: payload.pinnedAt ?? null,
   pinnedOrder:
     typeof payload.pinnedOrder === "number" ? payload.pinnedOrder : null,
+  focusType:
+    payload.focusType === 0 || payload.focusType === 1 || payload.focusType === 2
+      ? (payload.focusType as FocusType)
+      : null,
+  embeddingModel:
+    payload.embeddingModel === "openai-embeddings" ||
+    payload.embeddingModel === "bge-large-en-v1.5"
+      ? payload.embeddingModel
+      : null,
   messages: current?.messages ?? [],
   attachments: current?.attachments ?? []
 });
@@ -147,7 +181,7 @@ const normalizeAttachment = (payload: BackendAttachment): Attachment => {
     name: payload.name,
     type,
     url: attachmentContentUrl(payload.id),
-    createdAt: payload.createdAt
+    createdAt: payload.createdAt,
   };
 };
 
@@ -173,12 +207,23 @@ const sortUnpinnedConversations = (list: Conversation[]) =>
 export default function ChatApp() {
   const streamingEnabled =
     process.env.NEXT_PUBLIC_STREAMING_ENABLED !== "false";
+  const embeddingOptions: { label: string; value: EmbeddingModel }[] = [
+    { label: "OpenAI Embeddings", value: "openai-embeddings" },
+    { label: "BGE Large EN v1.5", value: "bge-large-en-v1.5" }
+  ];
   const { theme, setTheme } = useTheme();
   const [isSettingsOpen, setIsSettingsOpen] = React.useState(false);
   const settingsRef = React.useRef<HTMLDivElement>(null);
   const [isSidebarOpen, setIsSidebarOpen] = React.useState(false);
   const [selectedAttachment, setSelectedAttachment] =
     React.useState<Attachment | null>(null);
+  const [focusPromptOpen, setFocusPromptOpen] = React.useState(false);
+  const [focusPromptConversationId, setFocusPromptConversationId] =
+    React.useState<string | null>(null);
+  const [isFocusPromptSaving, setIsFocusPromptSaving] = React.useState(false);
+  const [pendingDeleteAttachment, setPendingDeleteAttachment] =
+    React.useState<Attachment | null>(null);
+  const [isDeletingAttachment, setIsDeletingAttachment] = React.useState(false);
   const toastTimeoutRef = React.useRef<ReturnType<typeof setTimeout> | null>(
     null
   );
@@ -192,6 +237,8 @@ export default function ChatApp() {
   const [mounted, setMounted] = React.useState(false);
   const [selectedModel, setSelectedModel] =
     React.useState<AIModel>("gpt-5-nano");
+  const [selectedEmbeddingModel, setSelectedEmbeddingModel] =
+    React.useState<EmbeddingModel>("openai-embeddings");
   const [useDocsDefaults, setUseDocsDefaults] = React.useState(true);
 
   const [conversations, setConversations] = React.useState<Conversation[]>([]);
@@ -409,6 +456,12 @@ export default function ChatApp() {
           file
         );
         const attachment = normalizeAttachment(data);
+        const isDuplicate = activeConversation.attachments.some(
+          (item) => item.id === attachment.id
+        );
+        const needsFocusPrompt = Boolean(
+          data.needsFocusPrompt && attachment.type === "pdf"
+        );
         updateConversation(conversationId, (conversation) => {
           const exists = conversation.attachments.some(
             (item) => item.id === attachment.id
@@ -419,9 +472,18 @@ export default function ChatApp() {
           return {
             ...conversation,
             attachments,
+            embeddingModel:
+              data.conversationEmbeddingModel === "openai-embeddings" ||
+              data.conversationEmbeddingModel === "bge-large-en-v1.5"
+                ? data.conversationEmbeddingModel
+                : conversation.embeddingModel,
             lastUpdatedAt: new Date().toISOString()
           };
         });
+        if (needsFocusPrompt && !isDuplicate) {
+          setFocusPromptConversationId(conversationId);
+          setFocusPromptOpen(true);
+        }
       } catch (error) {
         if (error instanceof ApiError && error.status === 400) {
           showToast(error.message || "Attachment limit reached.");
@@ -439,6 +501,28 @@ export default function ChatApp() {
         ...prev,
         [conversationId]: false
       }));
+    }
+  };
+
+  const handleFocusPromptSubmit = async (focusType: FocusType) => {
+    const conversationId = focusPromptConversationId;
+    if (!conversationId) return;
+    setIsFocusPromptSaving(true);
+    try {
+      const data = await patchJson<BackendConversation>(
+        `/conversations/${conversationId}`,
+        { focusType }
+      );
+      updateConversation(conversationId, (conversation) =>
+        normalizeConversation(data, conversation)
+      );
+      setFocusPromptOpen(false);
+      setFocusPromptConversationId(null);
+    } catch (error) {
+      showToast("Unable to save conversation focus.");
+      console.error(error);
+    } finally {
+      setIsFocusPromptSaving(false);
     }
   };
 
@@ -688,31 +772,53 @@ export default function ChatApp() {
     });
   }, [activeConversation, reportApiError]);
 
-  const handleDeleteAttachment = React.useCallback(
-    async (attachment: Attachment) => {
-      if (!activeConversation) return;
-      const confirmed = window.confirm(
-        `Delete ${attachment.name}? This removes it from this chat.`
-      );
-      if (!confirmed) return;
-      try {
-        await deleteJson(`/attachments/${attachment.id}`);
-        updateConversation(activeConversation.id, (conversation) => ({
-          ...conversation,
-          attachments: conversation.attachments.filter(
-            (item) => item.id !== attachment.id
-          )
-        }));
-        if (selectedAttachment?.id === attachment.id) {
-          setSelectedAttachment(null);
-        }
-      } catch (error) {
-        showToast("Unable to delete document.");
-        console.error(error);
+  const handleDeleteAttachment = React.useCallback((attachment: Attachment) => {
+    setPendingDeleteAttachment(attachment);
+  }, []);
+
+  const handleConfirmDeleteAttachment = async () => {
+    if (!pendingDeleteAttachment || !activeConversation) {
+      setPendingDeleteAttachment(null);
+      return;
+    }
+    setIsDeletingAttachment(true);
+    try {
+      const response = await deleteJson<{
+        status: string;
+        conversationId: number;
+        focusType: FocusType | null;
+        embeddingModel: EmbeddingModel | null;
+      }>(`/attachments/${pendingDeleteAttachment.id}`);
+      const conversationId = String(response.conversationId);
+      updateConversation(conversationId, (conversation) => ({
+        ...conversation,
+        attachments: conversation.attachments.filter(
+          (item) => item.id !== pendingDeleteAttachment.id
+        ),
+        focusType:
+          response.focusType === 0 ||
+          response.focusType === 1 ||
+          response.focusType === 2
+            ? response.focusType
+            : null,
+        embeddingModel:
+          response.embeddingModel === "openai-embeddings" ||
+          response.embeddingModel === "bge-large-en-v1.5"
+            ? response.embeddingModel
+            : null,
+        lastUpdatedAt: new Date().toISOString()
+      }));
+      if (selectedAttachment?.id === pendingDeleteAttachment.id) {
+        setSelectedAttachment(null);
       }
-    },
-    [activeConversation, selectedAttachment, showToast, updateConversation]
-  );
+      setPendingDeleteAttachment(null);
+    } catch (error) {
+      showToast("Unable to delete document.");
+      console.error(error);
+    } finally {
+      setIsDeletingAttachment(false);
+    }
+  };
 
   const handleSelectConversation = (id: string) => {
     setActiveId(id);
@@ -746,6 +852,51 @@ export default function ChatApp() {
       } else {
         showToast("Unable to update pin.");
       }
+      console.error(error);
+    }
+  };
+
+  const handleUpdateFocus = async (id: string, focusType: FocusType) => {
+    try {
+      const data = await patchJson<BackendConversation>(`/conversations/${id}`, {
+        focusType
+      });
+      updateConversation(id, (conversation) =>
+        normalizeConversation(data, conversation)
+      );
+    } catch (error) {
+      showToast("Unable to update conversation focus.");
+      console.error(error);
+    }
+  };
+
+  const handleEmbeddingSelect = async (value: EmbeddingModel) => {
+    if (activeConversation) {
+      const hasDocs = activeConversation.attachments.length > 0;
+      const isLocked = hasDocs && Boolean(activeConversation.embeddingModel);
+      if (isLocked) {
+        showToast("Embedding model is locked once documents exist.");
+        return;
+      }
+      try {
+        const data = await patchJson<BackendConversation>(
+          `/conversations/${activeConversation.id}`,
+          { embeddingModel: value }
+        );
+        updateConversation(activeConversation.id, (conversation) =>
+          normalizeConversation(data, conversation)
+        );
+      } catch (error) {
+        showToast("Unable to update embedding model.");
+        console.error(error);
+        return;
+      }
+    }
+
+    setSelectedEmbeddingModel(value);
+    try {
+      await patchJson("/settings", { embeddingModel: value });
+    } catch (error) {
       console.error(error);
     }
   };
@@ -819,6 +970,13 @@ export default function ChatApp() {
     ? useDocsByConversation[activeConversation.id] ??
       (useDocsEnabled ? useDocsDefaults : false)
     : false;
+  const activeEmbeddingModel =
+    activeConversation?.embeddingModel ?? selectedEmbeddingModel;
+  const embeddingLocked = Boolean(
+    activeConversation &&
+      activeConversation.attachments.length > 0 &&
+      activeConversation.embeddingModel
+  );
 
   const isStreaming = Boolean(
     activeConversation && streamingByConversation[activeConversation.id]
@@ -828,12 +986,16 @@ export default function ChatApp() {
 
   React.useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (!target) return;
       if (
         settingsRef.current &&
-        !settingsRef.current.contains(event.target as Node)
+        (settingsRef.current.contains(target) ||
+          target.closest("[data-settings-embedding-menu]"))
       ) {
-        setIsSettingsOpen(false);
+        return;
       }
+      setIsSettingsOpen(false);
     };
 
     const handleEscape = (event: KeyboardEvent) => {
@@ -874,6 +1036,14 @@ export default function ChatApp() {
   }, [mounted]);
 
   React.useEffect(() => {
+    if (!mounted) return;
+    const stored = window.localStorage.getItem("preferredEmbeddingModel");
+    if (stored === "openai-embeddings" || stored === "bge-large-en-v1.5") {
+      setSelectedEmbeddingModel(stored);
+    }
+  }, [mounted]);
+
+  React.useEffect(() => {
     return () => {
       if (toastTimeoutRef.current) {
         clearTimeout(toastTimeoutRef.current);
@@ -888,6 +1058,14 @@ export default function ChatApp() {
     if (!mounted) return;
     window.localStorage.setItem("preferredModel", selectedModel);
   }, [selectedModel, mounted]);
+
+  React.useEffect(() => {
+    if (!mounted) return;
+    window.localStorage.setItem(
+      "preferredEmbeddingModel",
+      selectedEmbeddingModel
+    );
+  }, [selectedEmbeddingModel, mounted]);
 
   React.useEffect(() => {
     if (!activeId) return;
@@ -940,14 +1118,22 @@ export default function ChatApp() {
     let isActive = true;
     const load = async () => {
       try {
-        const settings = await getJson<{ theme: Theme | null; useDocs: boolean }>(
-          "/settings"
-        );
+        const settings = await getJson<{
+          theme: Theme | null;
+          useDocs: boolean;
+          embeddingModel?: EmbeddingModel | null;
+        }>("/settings");
         if (!isActive) return;
         if (settings.theme === "light" || settings.theme === "dark") {
           setTheme(settings.theme);
         }
         setUseDocsDefaults(Boolean(settings.useDocs));
+        if (
+          settings.embeddingModel === "openai-embeddings" ||
+          settings.embeddingModel === "bge-large-en-v1.5"
+        ) {
+          setSelectedEmbeddingModel(settings.embeddingModel);
+        }
       } catch (error) {
         console.error(error);
       }
@@ -1035,6 +1221,7 @@ export default function ChatApp() {
             onDeleteConversation={handleDeleteConversation}
             onReorderPinned={handleReorderPinned}
             onSelectModel={setSelectedModel}
+            onUpdateFocus={handleUpdateFocus}
           />
         </div>
       ) : null}
@@ -1066,6 +1253,7 @@ export default function ChatApp() {
               onDeleteConversation={handleDeleteConversation}
               onReorderPinned={handleReorderPinned}
               onSelectModel={setSelectedModel}
+              onUpdateFocus={handleUpdateFocus}
             />
           </div>
         </div>
@@ -1151,6 +1339,60 @@ export default function ChatApp() {
                     </button>
                   ))}
                 </div>
+                <div className="mt-4 text-[11px] font-semibold uppercase tracking-[0.24em] text-muted">
+                  Embedding
+                </div>
+                <div className="mt-2">
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <button
+                        type="button"
+                        disabled={embeddingLocked}
+                        className={cn(
+                          "flex w-full items-center justify-between rounded-2xl border px-3 py-2.5 text-sm shadow-glow transition",
+                          embeddingLocked
+                            ? "cursor-not-allowed border-border/60 bg-panel/60 text-muted"
+                            : "border-border bg-card/80 text-ink hover:border-accent hover:bg-accent/40"
+                        )}
+                      >
+                        <span className="truncate">
+                          {embeddingOptions.find(
+                            (option) => option.value === activeEmbeddingModel
+                          )?.label ?? activeEmbeddingModel}
+                        </span>
+                        <ChevronDown className="h-4 w-4 text-muted" aria-hidden />
+                      </button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent
+                      side="left"
+                      align="start"
+                      sideOffset={8}
+                      className="w-[220px]"
+                      data-settings-embedding-menu
+                    >
+                      {embeddingOptions.map((option) => (
+                        <DropdownMenuItem
+                          key={option.value}
+                          onSelect={(event) => {
+                            event.preventDefault();
+                            handleEmbeddingSelect(option.value);
+                          }}
+                          className="flex items-center justify-between text-ink"
+                        >
+                          <span>{option.label}</span>
+                          {activeEmbeddingModel === option.value ? (
+                            <Check className="h-4 w-4" />
+                          ) : null}
+                        </DropdownMenuItem>
+                      ))}
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                </div>
+                {embeddingLocked ? (
+                  <div className="mt-2 text-xs text-muted">
+                    Locked for this chat once documents are uploaded.
+                  </div>
+                ) : null}
               </div>
             ) : null}
           </div>
@@ -1204,6 +1446,22 @@ export default function ChatApp() {
           useDocsEnabled={useDocsEnabled}
         />
       </div>
+      <ConversationFocusModal
+        open={focusPromptOpen}
+        isSaving={isFocusPromptSaving}
+        onSubmit={handleFocusPromptSubmit}
+        onClose={() => {
+          setFocusPromptOpen(false);
+          setFocusPromptConversationId(null);
+        }}
+      />
+      <DeleteAttachmentModal
+        open={Boolean(pendingDeleteAttachment)}
+        attachmentName={pendingDeleteAttachment?.name ?? ""}
+        isDeleting={isDeletingAttachment}
+        onConfirm={handleConfirmDeleteAttachment}
+        onCancel={() => setPendingDeleteAttachment(null)}
+      />
       {selectedAttachment ? (
         <AttachmentViewer
           attachment={selectedAttachment}
